@@ -7,7 +7,7 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import pygame
 import numpy as np
 from random import randint
-from pathFinding.pathFinding import astar
+from pathFinding.pathFinding import astar, get_straight_line, calculate_path_cost
 from rover.rover import Rover
 
 # --- Config (Same as yours) ---
@@ -15,6 +15,7 @@ SCREEN_W, SCREEN_H = 1920, 1080
 TILE_W,   TILE_H   = 48, 24
 TILE_DEPTH         = 5
 MAP_W,    MAP_H    = 400, 400 
+NUM_ROCKS          = 8000
 FPS                = 60
 
 COL_SKY        = (5, 8, 20)
@@ -27,43 +28,49 @@ OBJ_EMPTY, OBJ_ROCK_SMALL, OBJ_ROCK_LARGE = 0, 1, 2
 # 
 
 class WorldGenerator:
-    HEIGHT_LEVELS = 50 
+    HEIGHT_LEVELS = 70
     def __init__(self, width, height, seed=None):
         self.width, self.height = width, height
         self.seed = seed if seed is not None else randint(0, 100000)
         self.rng = np.random.default_rng(self.seed)
         self.gx, self.gy = np.meshgrid(np.arange(width), np.arange(height))
         hmap = self._build_heightmap()
-        hmap = self._add_craters(hmap, num_craters=300)
+        hmap = self._add_craters(hmap, num_craters=800)
         self.heightmap = np.clip(hmap, 0, 1)
         self.height_steps = (self.heightmap * self.HEIGHT_LEVELS).astype(np.int32)
         self.style_idx = self._build_style_map()
         self.object_map = self._generate_objects()
+        self.known_object_map = np.zeros((self.height, self.width), dtype=np.int32)
 
     def _build_heightmap(self):
         hmap = np.zeros((self.height, self.width), dtype=np.float32)
-        oct, pers, lac, amp, freq = 8, 0.5, 2.0, 1.0, 0.005
+        oct, pers, lac, amp, freq = 8, 0.5, 2.0, 1.0, 0.004
         for _ in range(oct):
             px, py = self.rng.uniform(0, 1000), self.rng.uniform(0, 1000)
             hmap += (np.sin((self.gx * freq) + px) * np.cos((self.gy * freq) + py)) * amp
             amp *= pers; freq *= lac
         hmap = (hmap - hmap.min()) / (hmap.max() - hmap.min())
-        return np.power(hmap, 2.0)
+        # Power of 2.2 creates rolling lunar highlands and flatter maria
+        return np.power(hmap, 2.2)
 
     def _add_craters(self, hmap, num_craters):
         for _ in range(num_craters):
             cx, cy = self.rng.integers(0, self.width), self.rng.integers(0, self.height)
-            rad, dep = self.rng.uniform(3, 18), self.rng.uniform(0.1, 0.3)
+            # Use exponential distribution: lots of small craters, very few massive ones
+            rad = np.clip(self.rng.exponential(scale=5.0), 3, 30)
+            dep = rad * self.rng.uniform(0.015, 0.035) 
+            
             x0, x1 = max(0, int(cx-rad*2)), min(self.width, int(cx+rad*2))
             y0, y1 = max(0, int(cy-rad*2)), min(self.height, int(cy+rad*2))
             lx, ly = np.meshgrid(np.arange(x0, x1), np.arange(y0, y1))
             dist = np.sqrt((lx-cx)**2 + (ly-cy)**2) / rad
-            hmap[y0:y1, x0:x1] += np.where(dist < 1.0, -dep * (1 - dist**2), 0) + (dep*0.4)*np.exp(-10*(dist-1.0)**2)
+            # Excavate crater bowl and add a localized raised rim
+            hmap[y0:y1, x0:x1] += np.where(dist < 1.0, -dep * (1 - dist**2), 0) + (dep*0.5)*np.exp(-10*(dist-1.0)**2)
         return hmap
 
     def _generate_objects(self):
         obj_map = np.zeros((self.height, self.width), dtype=np.int32)
-        for _ in range(3000):
+        for _ in range(NUM_ROCKS):
             rx, ry = self.rng.integers(0, self.width), self.rng.integers(0, self.height)
             if 0.3 < self.heightmap[ry, rx] < 0.8:
                 obj_map[ry, rx] = OBJ_ROCK_SMALL if self.rng.random() > 0.15 else OBJ_ROCK_LARGE
@@ -124,6 +131,7 @@ class WorldRenderer:
         self._scaled_tiles, self._last_zoom = [], -1.0
         self._star_bg = pygame.Surface((SCREEN_W, SCREEN_H)); self._star_bg.fill(COL_SKY)
         self._overlay = pygame.Surface((SCREEN_W, SCREEN_H), pygame.SRCALPHA)
+        self.font = pygame.font.SysFont("monospace", 14, bold=True)
 
     def _make_tile(self, t, l, r):
         s = pygame.Surface((TILE_W, TILE_H + TILE_DEPTH), pygame.SRCALPHA)
@@ -132,7 +140,7 @@ class WorldRenderer:
         pygame.draw.polygon(s, r, [(TILE_W//2, TILE_H), (TILE_W, TILE_H//2), (TILE_W, TILE_H//2+5), (TILE_W//2, TILE_H+5)])
         return s
 
-    def render(self, screen, hovered, path, start_node, end_node, rover=None):
+    def render(self, screen, hovered, path, start_node, end_node, rover=None, straight_path=None, path_cost=0.0, straight_cost=0.0):
         screen.blit(self._star_bg, (0, 0))
         self._overlay.fill((0, 0, 0, 0))
         
@@ -158,9 +166,9 @@ class WorldRenderer:
             if (x, y) in path_set and (x, y) != start_node and (x, y) != end_node:
                 self._draw_path_trail(sx[y,x], sy[y,x], zw, zh)
 
-            # 3. Draw Objects (Rocks)
-            if self.world.object_map[y,x] != OBJ_EMPTY:
-                self._draw_rock(screen, sx[y,x], sy[y,x], zw, zh, self.world.object_map[y,x])
+            # 3. Draw Objects (Rocks) only if they are known!
+            if self.world.known_object_map[y,x] != OBJ_EMPTY:
+                self._draw_rock(screen, sx[y,x], sy[y,x], zw, zh, self.world.known_object_map[y,x])
 
             # 4. Draw Start/End Holograms (Drawn last so they appear "on top")
             if (x, y) == start_node:
@@ -171,6 +179,22 @@ class WorldRenderer:
         # 5. Draw Connected Path Line
         if path and len(path) > 1:
             self._draw_connected_path(path, zw, zh, zd)
+
+        # Draw Straight Line
+        if straight_path and len(straight_path) > 1:
+            self._draw_connected_path(straight_path, zw, zh, zd, color=(255, 50, 50, 200), thick=3)
+            # Find midpoint for text
+            mid = straight_path[len(straight_path)//2]
+            msx = (mid[0] - mid[1]) * (zw//2) + self.camera.ox
+            msy = (mid[0] + mid[1]) * (zh//2) - (self.world.height_steps[mid[1], mid[0]] * zd) + self.camera.oy
+            self._draw_text(screen, f"Str Cost: {straight_cost:.0f}", msx, msy - 40, (255, 100, 100))
+
+        if start_node and end_node:
+            ex, ey = end_node
+            esx = (ex - ey) * (zw//2) + self.camera.ox
+            esy = (ex + ey) * (zh//2) - (self.world.height_steps[ey, ex] * zd) + self.camera.oy
+            if path_cost > 0:
+                self._draw_text(screen, f"Cost: {path_cost:.0f}", esx, esy - 65, (0, 255, 150))
 
         # 6. Draw Rover
         if rover:
@@ -259,7 +283,7 @@ class WorldRenderer:
         """Draws a small glowing dot for the path trail."""
         pygame.draw.circle(self._overlay, (255, 255, 0, 80), (sx, sy), 3)
 
-    def _draw_connected_path(self, path, zw, zh, zd):
+    def _draw_connected_path(self, path, zw, zh, zd, color=(255, 255, 0, 150), thick=2):
         """Draws a continuous line through the path coordinates."""
         points = []
         for px, py in path:
@@ -268,8 +292,14 @@ class WorldRenderer:
             points.append((psx, psy))
         
         if len(points) > 1:
-            # Draw a thick semi-transparent line
-            pygame.draw.lines(self._overlay, (255, 255, 0, 150), False, points, 2)
+            pygame.draw.lines(self._overlay, color, False, points, thick)
+
+    def _draw_text(self, screen, text, sx, sy, color):
+        surface = self.font.render(text, True, color)
+        rect = surface.get_rect(center=(sx, sy))
+        bg_rect = rect.inflate(8, 4)
+        pygame.draw.rect(screen, (0, 0, 0, 150), bg_rect, border_radius=4)
+        screen.blit(surface, rect)
 
 def main():
     pygame.init()
@@ -283,6 +313,9 @@ def main():
     start_node = None
     end_node = None
     path = []
+    straight_path = []
+    path_cost = 0.0
+    straight_cost = 0.0
     rover = None
 
     running = True
@@ -306,11 +339,17 @@ def main():
                         if (0 <= start_node[0] < world_w and 0 <= start_node[1] < world_h and 
                             0 <= end_node[0] < world_w and 0 <= end_node[1] < world_h):
                             
-                            # Convert numpy grid to list for the astar function
+                            # First path generated using known world memory
                             grid_data = world.height_steps.tolist()
-                            path = astar(grid_data, start_node, end_node)
-                            rover = Rover(start_node)
-                            rover.set_path(path)
+                            path = astar(grid_data, start_node, end_node, object_grid=world.known_object_map.tolist())
+                            
+                            if path:
+                                path_cost = calculate_path_cost(grid_data, path)
+                                straight_path = get_straight_line(start_node[0], start_node[1], end_node[0], end_node[1])
+                                straight_cost = calculate_path_cost(grid_data, straight_path)
+                                
+                                rover = Rover(start_node)
+                                rover.set_path(path)
                 
                 if event.button == 4: camera.adjust_zoom(0.1, (mx, my))
                 if event.button == 5: camera.adjust_zoom(-0.1, (mx, my))
@@ -327,10 +366,14 @@ def main():
         # Update Rover
         if rover:
             grid_data = world.height_steps.tolist()
-            obj_data = world.object_map.tolist()
-            rover.update(grid_data, obj_data)
+            # Pass ground truth and the mutable numpy known_map memory directly
+            rover.update(grid_data, world.object_map, world.known_object_map)
+            
+            # Recalculate active path cost dynamically
+            if rover.state == "MOVING" and rover.current_path:
+                path_cost = calculate_path_cost(grid_data, rover.current_path)
 
-        renderer.render(screen, hovered, path, start_node, end_node, rover)
+        renderer.render(screen, hovered, path, start_node, end_node, rover, straight_path, path_cost, straight_cost)
         
         # UI
         path_len = len(path) if path is not None else 0

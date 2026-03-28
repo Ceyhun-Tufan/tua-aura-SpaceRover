@@ -27,61 +27,48 @@ class Rover:
         self.state = "MOVING"
         self.local_path = []
 
-    def scan_radar(self, object_map):
-        """Checks the route immediately ahead for obstacles."""
+    def scan_radar(self, object_map, known_object_map):
+        """Sweeps a radius, reveals terrain to known memory, then checks immediate path."""
         if self.state != "MOVING" or not self.current_path:
             return None
 
-        # Look ahead 'radar_range' steps in current path
+        # 1. Fog of War Sweep (360 degrees)
+        cx, cy = int(round(self.gx)), int(round(self.gy))
+        h, w = len(object_map), len(object_map[0])
+        r = self.radar_range
+        
+        for dy in range(-r, r + 1):
+            for dx in range(-r, r + 1):
+                if dx*dx + dy*dy <= r*r:
+                    tx, ty = cx + dx, cy + dy
+                    if 0 <= ty < h and 0 <= tx < w:
+                        # Reveal ground truth to memory!
+                        known_object_map[ty][tx] = object_map[ty][tx]
+
+        # 2. Check the active path for obstacles USING THE KNOWN MAP
         look_limit = min(self.target_index + self.radar_range, len(self.current_path))
         for i in range(self.target_index, look_limit):
             tx, ty = self.current_path[i]
-            # Avoid bounds errors
-            if 0 <= ty < len(object_map) and 0 <= tx < len(object_map[0]):
-                if object_map[ty][tx] != 0:
+            if 0 <= ty < h and 0 <= tx < w:
+                if known_object_map[ty][tx] != 0:
                     return self.current_path[i] # Obstacle found!
         return None
 
-    def calculate_bypass(self, height_grid, object_map):
-        """A simple local bypass logic to reconnect to the global path."""
-        print("Obstacle detected! Calculating local bypass...")
+    def calculate_bypass(self, height_grid, known_object_map):
+        """Calculates a totally new path to the goal using updated memory."""
+        print("Obstacle detected! Calculating bypass...")
         self.state = "RECALCULATING"
         
         curr_node = (int(round(self.gx)), int(round(self.gy)))
+        final_goal = self.global_path[-1]
         
-        # 1. Find closest index in global_path to current position
-        closest_dist = float('inf')
-        closest_idx = 0
-        for i, (gx, gy) in enumerate(self.global_path):
-            dist = (gx - curr_node[0])**2 + (gy - curr_node[1])**2
-            if dist < closest_dist:
-                closest_dist = dist
-                closest_idx = i
-
-        # 2. Search forward from closest_idx to find a clear node
-        # Give it a small buffer (+2) to ensure we jump PAST the rock
-        search_start = min(closest_idx + 2, len(self.global_path) - 1)
-        reconnect_node = None
-        reconnect_idx = -1
-        
-        for i in range(search_start, len(self.global_path)):
-            tx, ty = self.global_path[i]
-            if 0 <= ty < len(object_map) and 0 <= tx < len(object_map[0]):
-                if object_map[ty][tx] == 0:
-                    reconnect_node = (tx, ty)
-                    reconnect_idx = i
-                    break
-                    
-        if not reconnect_node:
-            print("Cannot find a reconnect point. Stopping.")
-            self.state = "IDLE"
-            return
-            
-        # Use A* to find path from current to reconnect_node PASSING object_map
-        bypass_path = astar(height_grid, curr_node, reconnect_node, object_grid=object_map)
+        # Use A* to find path from current directly to the final goal!
+        # PASSING known_object_map so it routes around everything we know.
+        bypass_path = astar(height_grid, curr_node, final_goal, object_grid=known_object_map.tolist() if hasattr(known_object_map, 'tolist') else known_object_map)
         
         if bypass_path:
-            self.current_path = bypass_path + self.global_path[reconnect_idx+1:]
+            self.current_path = bypass_path
+            self.global_path = bypass_path  # Update global to our new route
             self.target_index = 1 if len(bypass_path) > 1 else 0
             self.state = "MOVING"
             print("Bypass path established. Resuming.")
@@ -89,15 +76,15 @@ class Rover:
             print("No viable bypass could be computed. Halting.")
             self.state = "IDLE"
 
-    def update(self, height_grid, object_map):
+    def update(self, height_grid, object_map, known_object_map):
         if self.state == "IDLE" or not self.current_path:
             return
             
         if self.state == "MOVING":
-            # 1. Radar check against object_map (numpy array so tolist is not needed, array indexing works for 2d)
-            obstacle_node = self.scan_radar(object_map)
+            # 1. Radar sweep ground truth, update memory, check if blocked.
+            obstacle_node = self.scan_radar(object_map, known_object_map)
             if obstacle_node:
-                self.calculate_bypass(height_grid, object_map)
+                self.calculate_bypass(height_grid, known_object_map)
                 if self.state == "IDLE": return
 
             # 2. Move
