@@ -15,6 +15,8 @@ import heapq
 # ── Ayarlar ───────────────────────────────────────────────────────────────────
 SLOPE_PENALTY = 3.0          # Yokuş yukarı her birim için ek maliyet
 DIAGONAL_COST = math.sqrt(2) # Çapraz hareketin taban maliyeti
+MAX_CLIMB = 3                # Maksimum tırmanılabilir yükseklik adımı (yaklaşık 30 derecelik eşik)
+ROUGHNESS_PENALTY_MAX = 8.0  # Pürüzlü / gevşek zeminlerde maksimum gecikme cezası
 
 _NEIGHBOURS = [
     ( 1,  0, 1.0),
@@ -32,7 +34,8 @@ def astar(
     height_grid: list[list[int]],
     start: tuple[int, int],
     goal:  tuple[int, int],
-    object_grid: list[list[int]] | None = None
+    object_grid: list[list[int]] | None = None,
+    roughness_grid: list[list[float]] | None = None
 ) -> list[tuple[int, int]] | None:
     """
     Yükseklik haritası üzerinde en düşük maliyetli yolu bulur. Opsiyonel olarak engelleri (0'dan farklı değerleri) önleyebilir.
@@ -90,7 +93,19 @@ def astar(
                 continue
 
             dh = height_grid[ny][nx] - ch                 # pozitif = yokuş yukarı
-            tg = g + base_cost + max(0.0, dh) * SLOPE_PENALTY
+            
+            # Fiziksel eğim sınırı (Rover çok dik yerlere çıkamaz/inemez)
+            if abs(dh) > MAX_CLIMB:
+                continue
+                
+            is_diag = (dx != 0 and dy != 0)
+            base_cost = DIAGONAL_COST if is_diag else 1.0
+            
+            r_cost = 0.0
+            if roughness_grid is not None:
+                r_cost = roughness_grid[ny][nx] * ROUGHNESS_PENALTY_MAX
+                
+            tg = g + base_cost + max(0.0, dh) * SLOPE_PENALTY + r_cost
 
             if tg < g_score.get((nx, ny), math.inf):
                 g_score[(nx, ny)]   = tg
@@ -100,6 +115,67 @@ def astar(
 
     return None  # Yol bulunamadı
 
+def dijkstra(
+    height_grid: list[list[int]],
+    start: tuple[int, int],
+    goal: tuple[int, int],
+    object_grid: list[list[int]] = None,
+    roughness_grid: list[list[float]] = None
+) -> list[tuple[int, int]]:
+    """Dijkstra pathfinding algoritması (A* ile aynı, sadece sezgisel/heuristic kullanmaz)."""
+    rows = len(height_grid)
+    cols = len(height_grid[0])
+    
+    open_set = []
+    heapq.heappush(open_set, (0.0, start[0], start[1]))
+    
+    came_from = {}
+    g_score = {start: 0.0}
+    
+    while open_set:
+        current_g, cx, cy = heapq.heappop(open_set)
+        current = (cx, cy)
+        
+        if current == goal:
+            path = []
+            while current in came_from:
+                path.append(current)
+                current = came_from[current]
+            path.append(start)
+            path.reverse()
+            return path
+            
+        if current_g > g_score.get((cx, cy), float('inf')):
+            continue
+            
+        for dy, dx in [(-1, 0), (1, 0), (0, -1), (0, 1), (-1, -1), (-1, 1), (1, -1), (1, 1)]:
+            nx, ny = cx + dx, cy + dy
+            
+            if 0 <= ny < rows and 0 <= nx < cols:
+                if object_grid is not None and object_grid[ny][nx] != 0:
+                    continue  
+
+                dh = height_grid[ny][nx] - height_grid[cy][cx]
+                
+                # Fiziksel eğim sınırı
+                if abs(dh) > MAX_CLIMB:
+                    continue
+                
+                is_diag = (dx != 0 and dy != 0)
+                base_cost = DIAGONAL_COST if is_diag else 1.0
+                
+                r_cost = 0.0
+                if roughness_grid is not None:
+                    r_cost = roughness_grid[ny][nx] * ROUGHNESS_PENALTY_MAX
+                    
+                tg = current_g + base_cost + max(0.0, dh) * SLOPE_PENALTY + r_cost
+
+                if tg < g_score.get((nx, ny), float('inf')):
+                    g_score[(nx, ny)]   = tg
+                    came_from[(nx, ny)] = (cx, cy)
+                    heapq.heappush(open_set, (tg, nx, ny))
+
+    return None
 
 def _heuristic(ax: int, ay: int, bx: int, by: int) -> float:
     """8 yönlü grid için kabul edilebilir oktil mesafe tahmini."""
@@ -135,7 +211,7 @@ def get_straight_line(x0: int, y0: int, x1: int, y1: int) -> list[tuple[int, int
     path.append((x, y))
     return path
 
-def calculate_path_cost(height_grid: list[list[int]], path: list[tuple[int, int]]) -> float:
+def calculate_path_cost(height_grid: list[list[int]], path: list[tuple[int, int]], roughness_grid: list[list[float]] = None) -> float:
     """Calculates the total travel cost of a generated path."""
     if not path or len(path) < 2:
         return 0.0
@@ -148,5 +224,12 @@ def calculate_path_cost(height_grid: list[list[int]], path: list[tuple[int, int]
         base_cost = DIAGONAL_COST if is_diag else 1.0
         
         dh = height_grid[ny][nx] - height_grid[cy][cx]
-        cost += base_cost + max(0.0, dh) * SLOPE_PENALTY
+        if abs(dh) > MAX_CLIMB:
+            cost += float('inf')
+            
+        r_cost = 0.0
+        if roughness_grid is not None:
+            r_cost = roughness_grid[ny][nx] * ROUGHNESS_PENALTY_MAX
+            
+        cost += base_cost + max(0.0, dh) * SLOPE_PENALTY + r_cost
     return cost

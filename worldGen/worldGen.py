@@ -7,7 +7,7 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import pygame
 import numpy as np
 from random import randint
-from pathFinding.pathFinding import astar, get_straight_line, calculate_path_cost
+from pathFinding.pathFinding import astar, dijkstra, get_straight_line, calculate_path_cost
 from rover.rover import Rover
 
 # --- Config (Same as yours) ---
@@ -15,7 +15,7 @@ SCREEN_W, SCREEN_H = 1920, 1080
 TILE_W,   TILE_H   = 48, 24
 TILE_DEPTH         = 5
 MAP_W,    MAP_H    = 400, 400 
-NUM_ROCKS          = 8000
+NUM_ROCKS          = 10000
 FPS                = 60
 
 COL_SKY        = (5, 8, 20)
@@ -38,6 +38,7 @@ class WorldGenerator:
         hmap = self._add_craters(hmap, num_craters=800)
         self.heightmap = np.clip(hmap, 0, 1)
         self.height_steps = (self.heightmap * self.HEIGHT_LEVELS).astype(np.int32)
+        self.roughness_map = self._build_roughness_map()
         self.style_idx = self._build_style_map()
         self.object_map = self._generate_objects()
         self.known_object_map = np.zeros((self.height, self.width), dtype=np.int32)
@@ -52,6 +53,17 @@ class WorldGenerator:
         hmap = (hmap - hmap.min()) / (hmap.max() - hmap.min())
         # Power of 2.2 creates rolling lunar highlands and flatter maria
         return np.power(hmap, 2.2)
+
+    def _build_roughness_map(self):
+        rmap = np.zeros((self.height, self.width), dtype=np.float32)
+        # Higher frequency creates distinct localized patches of soft/rough terrain
+        oct, pers, lac, amp, freq = 6, 0.5, 2.0, 1.0, 0.015
+        for _ in range(oct):
+            px, py = self.rng.uniform(0, 1000), self.rng.uniform(0, 1000)
+            rmap += (np.sin((self.gx * freq) + px) * np.cos((self.gy * freq) + py)) * amp
+            amp *= pers; freq *= lac
+        rmap = (rmap - rmap.min()) / (rmap.max() - rmap.min())
+        return rmap
 
     def _add_craters(self, hmap, num_craters):
         for _ in range(num_craters):
@@ -78,7 +90,12 @@ class WorldGenerator:
 
     def _build_style_map(self):
         idx = np.zeros((self.height, self.width), dtype=np.int32)
-        idx[self.heightmap > 0.40], idx[self.heightmap > 0.75], idx[self.heightmap < 0.15] = 1, 2, 3
+        idx[self.heightmap > 0.40] = 1
+        idx[self.heightmap > 0.75] = 2
+        idx[self.heightmap < 0.15] = 3
+        
+        # If roughness > 0.6, shift to rough texture variations (+4 shift)
+        idx[self.roughness_map > 0.6] += 4
         return idx
 
 class Camera:
@@ -127,20 +144,36 @@ class Camera:
 class WorldRenderer:
     def __init__(self, world, camera):
         self.world, self.camera = world, camera
-        self._base_tiles = [self._make_tile(COL_TILE_TOP[i], COL_TILE_LEFT[i], COL_TILE_RIGHT[i]) for i in range(4)]
+        
+        self._base_tiles = []
+        # Index 0-3: Smooth Textures
+        for i in range(4):
+            self._base_tiles.append(self._make_tile(COL_TILE_TOP[i], COL_TILE_LEFT[i], COL_TILE_RIGHT[i], is_rough=False))
+        # Index 4-7: Rough/Gritty Textures
+        for i in range(4):
+            self._base_tiles.append(self._make_tile(COL_TILE_TOP[i], COL_TILE_LEFT[i], COL_TILE_RIGHT[i], is_rough=True))
+            
         self._scaled_tiles, self._last_zoom = [], -1.0
         self._star_bg = pygame.Surface((SCREEN_W, SCREEN_H)); self._star_bg.fill(COL_SKY)
         self._overlay = pygame.Surface((SCREEN_W, SCREEN_H), pygame.SRCALPHA)
         self.font = pygame.font.SysFont("monospace", 14, bold=True)
 
-    def _make_tile(self, t, l, r):
+    def _make_tile(self, t, l, r, is_rough=False):
         s = pygame.Surface((TILE_W, TILE_H + TILE_DEPTH), pygame.SRCALPHA)
         pygame.draw.polygon(s, t, [(TILE_W//2, 0), (TILE_W, TILE_H//2), (TILE_W//2, TILE_H), (0, TILE_H//2)])
+        
+        if is_rough:
+            import random
+            for _ in range(15):
+                dx = random.randint(TILE_W//4, TILE_W - TILE_W//4)
+                dy = random.randint(TILE_H//4, TILE_H - TILE_H//4)
+                pygame.draw.line(s, (20, 20, 25, 120), (dx, dy), (dx+1, dy))
+                
         pygame.draw.polygon(s, l, [(0, TILE_H//2), (TILE_W//2, TILE_H), (TILE_W//2, TILE_H+5), (0, TILE_H//2+5)])
         pygame.draw.polygon(s, r, [(TILE_W//2, TILE_H), (TILE_W, TILE_H//2), (TILE_W, TILE_H//2+5), (TILE_W//2, TILE_H+5)])
         return s
 
-    def render(self, screen, hovered, path, start_node, end_node, rover=None, straight_path=None, path_cost=0.0, straight_cost=0.0):
+    def render(self, screen, hovered, path, start_node, end_node, rover=None, straight_path=None, dijkstra_path=None, path_cost=0.0, straight_cost=0.0, dijkstra_cost=0.0):
         screen.blit(self._star_bg, (0, 0))
         self._overlay.fill((0, 0, 0, 0))
         
@@ -176,9 +209,17 @@ class WorldRenderer:
             elif (x, y) == end_node:
                 self._draw_marker(sx[y,x], sy[y,x], zw, zh, (255, 50, 50), "TARGET")
 
-        # 5. Draw Connected Path Line
+        # 5. Draw Connected Path Line (A*)
         if path and len(path) > 1:
-            self._draw_connected_path(path, zw, zh, zd)
+            self._draw_connected_path(path, zw, zh, zd, color=(255, 255, 0, 150))
+            
+        # Draw Dijkstra Path
+        if dijkstra_path and len(dijkstra_path) > 1:
+            self._draw_connected_path(dijkstra_path, zw, zh, zd, color=(180, 50, 255, 180), thick=2)
+            mid = dijkstra_path[max(0, len(dijkstra_path)//2 - 2)]
+            msx = (mid[0] - mid[1]) * (zw//2) + self.camera.ox
+            msy = (mid[0] + mid[1]) * (zh//2) - (self.world.height_steps[mid[1], mid[0]] * zd) + self.camera.oy
+            self._draw_text(screen, f"Dijkstra: {dijkstra_cost:.0f}", msx, msy + 35, (180, 100, 255))
 
         # Draw Straight Line
         if straight_path and len(straight_path) > 1:
@@ -188,6 +229,14 @@ class WorldRenderer:
             msx = (mid[0] - mid[1]) * (zw//2) + self.camera.ox
             msy = (mid[0] + mid[1]) * (zh//2) - (self.world.height_steps[mid[1], mid[0]] * zd) + self.camera.oy
             self._draw_text(screen, f"Str Cost: {straight_cost:.0f}", msx, msy - 40, (255, 100, 100))
+            
+        # Draw Danger Signs for Dodged Obstacles
+        if rover and hasattr(rover, 'dodged_obstacles'):
+            for (dx, dy) in rover.dodged_obstacles:
+                if 0 <= dy < self.world.height and 0 <= dx < self.world.width:
+                    dsx = (dx - dy) * (zw//2) + self.camera.ox
+                    dsy = (dx + dy) * (zh//2) - (self.world.height_steps[dy, dx] * zd) + self.camera.oy
+                    self._draw_marker(dsx, dsy, zw, zh, (255, 100, 0), "!")
 
         if start_node and end_node:
             ex, ey = end_node
@@ -313,8 +362,10 @@ def main():
     start_node = None
     end_node = None
     path = []
+    dijkstra_path = []
     straight_path = []
     path_cost = 0.0
+    dijkstra_cost = 0.0
     straight_cost = 0.0
     rover = None
 
@@ -341,15 +392,25 @@ def main():
                             
                             # First path generated using known world memory
                             grid_data = world.height_steps.tolist()
-                            path = astar(grid_data, start_node, end_node, object_grid=world.known_object_map.tolist())
+                            known_grid = world.known_object_map.tolist()
+                            rough_grid = world.roughness_map.tolist()
                             
-                            if path:
-                                path_cost = calculate_path_cost(grid_data, path)
+                            path = astar(grid_data, start_node, end_node, object_grid=known_grid, roughness_grid=rough_grid)
+                            dijkstra_path = dijkstra(grid_data, start_node, end_node, object_grid=known_grid, roughness_grid=rough_grid)
+                            
+                            if path or dijkstra_path:
+                                path_cost = calculate_path_cost(grid_data, path, roughness_grid=rough_grid) if path else float('inf')
+                                dijkstra_cost = calculate_path_cost(grid_data, dijkstra_path, roughness_grid=rough_grid) if dijkstra_path else float('inf')
                                 straight_path = get_straight_line(start_node[0], start_node[1], end_node[0], end_node[1])
-                                straight_cost = calculate_path_cost(grid_data, straight_path)
+                                straight_cost = calculate_path_cost(grid_data, straight_path, roughness_grid=rough_grid)
                                 
                                 rover = Rover(start_node)
-                                rover.set_path(path)
+                                if path_cost <= dijkstra_cost and path:
+                                    rover.set_path(path)
+                                    print(f"A* chosen. A*: {path_cost:.1f}, Dijkstra: {dijkstra_cost:.1f}")
+                                elif dijkstra_path:
+                                    rover.set_path(dijkstra_path)
+                                    print(f"Dijkstra chosen. A*: {path_cost:.1f}, Dijkstra: {dijkstra_cost:.1f}")
                 
                 if event.button == 4: camera.adjust_zoom(0.1, (mx, my))
                 if event.button == 5: camera.adjust_zoom(-0.1, (mx, my))
@@ -366,14 +427,16 @@ def main():
         # Update Rover
         if rover:
             grid_data = world.height_steps.tolist()
-            # Pass ground truth and the mutable numpy known_map memory directly
-            rover.update(grid_data, world.object_map, world.known_object_map)
+            # Pass ground truth, the mutable known_map memory, and the roughness grid directly
+            rover.update(grid_data, world.object_map, world.known_object_map, world.roughness_map.tolist())
             
             # Recalculate active path cost dynamically
             if rover.state == "MOVING" and rover.current_path:
-                path_cost = calculate_path_cost(grid_data, rover.current_path)
+                # Use the actual logical departure node to prevent float rounding errors triggering artificial cliff penalties
+                remainder_path = rover.current_path[max(0, rover.target_index - 1):]
+                path_cost = rover.accumulated_cost + calculate_path_cost(grid_data, remainder_path, roughness_grid=world.roughness_map.tolist())
 
-        renderer.render(screen, hovered, path, start_node, end_node, rover, straight_path, path_cost, straight_cost)
+        renderer.render(screen, hovered, path, start_node, end_node, rover, straight_path, dijkstra_path, path_cost, straight_cost, dijkstra_cost)
         
         # UI
         path_len = len(path) if path is not None else 0

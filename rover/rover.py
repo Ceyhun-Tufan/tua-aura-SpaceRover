@@ -1,10 +1,10 @@
 import math
-from pathFinding.pathFinding import astar
+from pathFinding.pathFinding import astar, dijkstra, calculate_path_cost
 
 class Rover:
     def __init__(self, start_node):
         self.gx, self.gy = float(start_node[0]), float(start_node[1])
-        self.speed = 0.08  # Movement speed across tiles
+        self.speed = 0.5  # Movement speed across tiles
         
         self.global_path = [] # Full satellite path
         self.local_path = []  # Bypass path if obstacle found
@@ -14,6 +14,10 @@ class Rover:
         
         self.radar_range = 4 # How many tiles ahead to check
         self.state = "IDLE"
+        
+        self.dodged_obstacles = set()
+        self.accumulated_cost = 0.0
+        self.previous_node = (int(round(self.gx)), int(round(self.gy)))
 
     def set_path(self, path):
         if not path:
@@ -26,6 +30,10 @@ class Rover:
         self.target_index = 1 if len(path) > 1 else 0
         self.state = "MOVING"
         self.local_path = []
+        
+        self.dodged_obstacles = set()
+        self.accumulated_cost = 0.0
+        self.previous_node = (int(round(self.gx)), int(round(self.gy)))
 
     def scan_radar(self, object_map, known_object_map):
         """Sweeps a radius, reveals terrain to known memory, then checks immediate path."""
@@ -54,7 +62,7 @@ class Rover:
                     return self.current_path[i] # Obstacle found!
         return None
 
-    def calculate_bypass(self, height_grid, known_object_map):
+    def calculate_bypass(self, height_grid, known_object_map, roughness_grid=None):
         """Calculates a totally new path to the goal using updated memory."""
         print("Obstacle detected! Calculating bypass...")
         self.state = "RECALCULATING"
@@ -62,21 +70,39 @@ class Rover:
         curr_node = (int(round(self.gx)), int(round(self.gy)))
         final_goal = self.global_path[-1]
         
-        # Use A* to find path from current directly to the final goal!
-        # PASSING known_object_map so it routes around everything we know.
-        bypass_path = astar(height_grid, curr_node, final_goal, object_grid=known_object_map.tolist() if hasattr(known_object_map, 'tolist') else known_object_map)
+        obstacle_grid = known_object_map.tolist() if hasattr(known_object_map, 'tolist') else known_object_map
+        bypass_path_astar = astar(height_grid, curr_node, final_goal, object_grid=obstacle_grid, roughness_grid=roughness_grid)
+        bypass_path_dijkstra = dijkstra(height_grid, curr_node, final_goal, object_grid=obstacle_grid, roughness_grid=roughness_grid)
+        
+        cost_a = calculate_path_cost(height_grid, bypass_path_astar, roughness_grid=roughness_grid) if bypass_path_astar else float('inf')
+        cost_d = calculate_path_cost(height_grid, bypass_path_dijkstra, roughness_grid=roughness_grid) if bypass_path_dijkstra else float('inf')
+        
+        if cost_a <= cost_d and bypass_path_astar:
+            bypass_path = bypass_path_astar
+            print(f"A* chosen. A*: {cost_a:.1f}, Dijkstra: {cost_d:.1f}")
+        else:
+            bypass_path = bypass_path_dijkstra
+            print(f"Dijkstra chosen. A*: {cost_a:.1f}, Dijkstra: {cost_d:.1f}")
         
         if bypass_path:
             self.current_path = bypass_path
             self.global_path = bypass_path  # Update global to our new route
             self.target_index = 1 if len(bypass_path) > 1 else 0
             self.state = "MOVING"
+            
+            # Snap previous node to prevent INF cost gaps when resuming physical movement
+            if self.previous_node != curr_node:
+                cost = calculate_path_cost(height_grid, [self.previous_node, curr_node], roughness_grid=roughness_grid)
+                if cost == float('inf'): cost = 1.0
+                self.accumulated_cost += cost
+                self.previous_node = curr_node
+                
             print("Bypass path established. Resuming.")
         else:
             print("No viable bypass could be computed. Halting.")
             self.state = "IDLE"
 
-    def update(self, height_grid, object_map, known_object_map):
+    def update(self, height_grid, object_map, known_object_map, roughness_grid=None):
         if self.state == "IDLE" or not self.current_path:
             return
             
@@ -84,7 +110,8 @@ class Rover:
             # 1. Radar sweep ground truth, update memory, check if blocked.
             obstacle_node = self.scan_radar(object_map, known_object_map)
             if obstacle_node:
-                self.calculate_bypass(height_grid, known_object_map)
+                self.dodged_obstacles.add(obstacle_node)
+                self.calculate_bypass(height_grid, known_object_map, roughness_grid=roughness_grid)
                 if self.state == "IDLE": return
 
             # 2. Move
@@ -98,6 +125,9 @@ class Rover:
             dist = math.hypot(dx, dy)
             
             if dist < self.speed:
+                self.accumulated_cost += calculate_path_cost(height_grid, [self.previous_node, (tx, ty)], roughness_grid=roughness_grid)
+                self.previous_node = (tx, ty)
+                
                 self.gx, self.gy = float(tx), float(ty)
                 self.target_index += 1
             else:
