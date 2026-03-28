@@ -4,7 +4,7 @@ import sys
 import math
 from random import randint
 # ── Config ───────────────────────────────────────────────────────────────────
-SCREEN_W, SCREEN_H = 1920, 1080
+SCREEN_W, SCREEN_H = 1280, 720
 TILE_W,   TILE_H   = 24, 12       # Smaller tiles to fit the "bigger" world
 TILE_DEPTH         = 5
 MAP_W,    MAP_H    = 400, 400     # Much larger map
@@ -31,17 +31,47 @@ class WorldGenerator:
 
         self.gx, self.gy = np.meshgrid(np.arange(width), np.arange(height))
         
-        # 1. Start with base rough terrain
+        # 1. Generate the base Perlin-like surface
         hmap = self._build_heightmap()
         
-        # 2. Add Craters
-        hmap = self._generate_craters(hmap, num_craters=150)
+        # 2. STAMP THE CRATERS HERE
+        hmap = self._add_craters(hmap, num_craters=250)
         
-        # 3. Normalize and quantize
-        hmap = np.clip(hmap, 0, 1)
+        # 3. Normalize and finalize
+        hmap = np.clip(hmap, 0, 1) # Ensure no heights go below 0 or above 1
         self.heightmap = hmap
         self.height_steps = (self.heightmap * self.HEIGHT_LEVELS).astype(np.int32)
         self.style_idx = self._build_style_map()
+
+    def _add_craters(self, hmap, num_craters=100):
+        for _ in range(num_craters):
+            # 1. Randomize crater properties
+            cx = self.rng.integers(0, self.width)
+            cy = self.rng.integers(0, self.height)
+            radius = self.rng.uniform(3, 20)
+            depth = self.rng.uniform(0.1, 0.3)
+
+            # 2. Optimization: Only look at a small bounding box around the crater
+            x0, x1 = max(0, int(cx - radius*2)), min(self.width, int(cx + radius*2))
+            y0, y1 = max(0, int(cy - radius*2)), min(self.height, int(cy + radius*2))
+            
+            # 3. Calculate distance from center for this local patch
+            lx, ly = np.meshgrid(np.arange(x0, x1), np.arange(y0, y1))
+            dist = np.sqrt((lx - cx)**2 + (ly - cy)**2)
+            r_dist = dist / radius  # Normalized distance (1.0 = at the rim)
+
+            # 4. The "Bowl" and "Rim" Math
+            # Floor: A smooth parabolic dip inside the radius
+            floor = np.where(r_dist < 1.0, -depth * (1 - r_dist**2), 0)
+            
+            # Rim: A sharp peak that happens exactly at the radius (r_dist = 1)
+            # We use a Gaussian curve to make the rim fall off quickly
+            rim = (depth * 0.4) * np.exp(-10 * (r_dist - 1.0)**2)
+
+            # 5. Apply the crater to the heightmap patch
+            hmap[y0:y1, x0:x1] += (floor + rim)
+
+        return hmap
 
     def _build_heightmap(self):
             # 1. Initialize empty map
