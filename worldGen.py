@@ -117,10 +117,11 @@ class WorldGenerator:
     def _build_style_map(self):
         h = self.heightmap
         idx = np.zeros((self.height, self.width), dtype=np.int32)
-        # 0: Dust (Mid), 1: Highland (High), 2: Peak (Very High), 3: Basalt/Maria (Low)
-        idx[h > 0.55] = 1
-        idx[h > 0.80] = 2
-        idx[h < 0.30] = 3
+        
+        # These thresholds determine where the 'dust' vs 'rock' is
+        idx[h > 0.40] = 1  # Standard Moon Dust
+        idx[h > 0.75] = 2  # Bright Highland Peaks
+        idx[h < 0.15] = 3  # Dark Basaltic Plains (Maria)
         return idx
 
 # ══════════════════════════════════════════════════════════════════════════════
