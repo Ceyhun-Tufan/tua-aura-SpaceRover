@@ -154,6 +154,7 @@ class WorldRenderer:
             self._base_tiles.append(self._make_tile(COL_TILE_TOP[i], COL_TILE_LEFT[i], COL_TILE_RIGHT[i], is_rough=True))
             
         self._scaled_tiles, self._last_zoom = [], -1.0
+        self._scaled_rocks = {}
         self._star_bg = pygame.Surface((SCREEN_W, SCREEN_H)); self._star_bg.fill(COL_SKY)
         self._overlay = pygame.Surface((SCREEN_W, SCREEN_H), pygame.SRCALPHA)
         self.font = pygame.font.SysFont("monospace", 14, bold=True)
@@ -173,6 +174,16 @@ class WorldRenderer:
         pygame.draw.polygon(s, r, [(TILE_W//2, TILE_H), (TILE_W, TILE_H//2), (TILE_W, TILE_H//2+5), (TILE_W//2, TILE_H+5)])
         return s
 
+    def _make_rock_surf(self, zw, zh, obj_type):
+        surf = pygame.Surface((zw, zh), pygame.SRCALPHA)
+        color = (100,105,120) if obj_type==1 else (70,75,90)
+        sz = 0.2 if obj_type==1 else 0.45
+        rw, rh = zw*sz, zh*sz
+        bx, by = zw//2, zh//2 + zh//4
+        pts = [(bx-rw//2, by), (bx, by-rh), (bx+rw//2, by+rh//4), (bx, by+rh//2)]
+        pygame.draw.polygon(surf, color, pts); pygame.draw.polygon(surf, (10,10,20), pts, 1)
+        return surf
+
     def render(self, screen, hovered, path, start_node, end_node, rover=None, straight_path=None, dijkstra_path=None, path_cost=0.0, straight_cost=0.0, dijkstra_cost=0.0):
         screen.blit(self._star_bg, (0, 0))
         self._overlay.fill((0, 0, 0, 0))
@@ -182,6 +193,10 @@ class WorldRenderer:
         
         if z != self._last_zoom:
             self._scaled_tiles = [pygame.transform.scale(t, (zw, zh+zd)) for t in self._base_tiles]
+            self._scaled_rocks = {
+                1: self._make_rock_surf(zw, zh, 1),
+                2: self._make_rock_surf(zw, zh, 2)
+            }
             self._last_zoom = z
 
         # Calculate all screen positions at once
@@ -191,19 +206,24 @@ class WorldRenderer:
         vis = (sx > -zw*2) & (sx < SCREEN_W+zw*2) & (sy > -zh*2) & (sy < SCREEN_H+zh*2)
         path_set = set(path) if path else set()
 
+        blit_seq = []
+
+        # 1 & 2: Build bulk sequence for Tiles and Objects to draw simultaneously respecting Depth 
         for y, x in np.argwhere(vis):
-            # 1. Draw Tile
-            screen.blit(self._scaled_tiles[self.world.style_idx[y,x]], (sx[y,x]-zw//2, sy[y,x]))
+            blit_seq.append((self._scaled_tiles[self.world.style_idx[y,x]], (sx[y,x]-zw//2, sy[y,x])))
             
-            # 2. Draw Path Trail (Subtle)
+            obj = self.world.known_object_map[y,x]
+            if obj != 0: # OBJ_EMPTY is 0
+                blit_seq.append((self._scaled_rocks[obj], (sx[y,x]-zw//2, sy[y,x]-zh//2)))
+                
+        # Fire bulk draw command (C-Accelerated, exponentially faster than Python loop blits)
+        screen.blits(blit_seq)
+
+        # Draw overlays (Paths, Holograms) separately
+        for y, x in np.argwhere(vis):
             if (x, y) in path_set and (x, y) != start_node and (x, y) != end_node:
                 self._draw_path_trail(sx[y,x], sy[y,x], zw, zh)
 
-            # 3. Draw Objects (Rocks) only if they are known!
-            if self.world.known_object_map[y,x] != OBJ_EMPTY:
-                self._draw_rock(screen, sx[y,x], sy[y,x], zw, zh, self.world.known_object_map[y,x])
-
-            # 4. Draw Start/End Holograms (Drawn last so they appear "on top")
             if (x, y) == start_node:
                 self._draw_marker(sx[y,x], sy[y,x], zw, zh, (0, 255, 150), "START")
             elif (x, y) == end_node:
@@ -271,13 +291,7 @@ class WorldRenderer:
 
         screen.blit(self._overlay, (0, 0))
 
-    def _draw_rock(self, screen, sx, sy, zw, zh, obj_type):
-        color = (100,105,120) if obj_type==1 else (70,75,90)
-        sz = 0.2 if obj_type==1 else 0.45
-        rw, rh = zw*sz, zh*sz
-        bx, by = sx, sy + zh//4
-        pts = [(bx-rw//2, by), (bx, by-rh), (bx+rw//2, by+rh//4), (bx, by+rh//2)]
-        pygame.draw.polygon(screen, color, pts); pygame.draw.polygon(screen, (10,10,20), pts, 1)
+    # Replaced _draw_rock manual polygon rasterization into cached _make_rock_surf
 
     def _draw_rover(self, screen, rsx, rsy, zw, zh):
         """Draws the rover as a distinct golden object."""
