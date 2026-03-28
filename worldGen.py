@@ -4,7 +4,7 @@ import sys
 import math
 from random import randint
 # ── Config ───────────────────────────────────────────────────────────────────
-SCREEN_W, SCREEN_H = 1280, 720
+SCREEN_W, SCREEN_H = 1920, 1080
 TILE_W,   TILE_H   = 24, 12       # Smaller tiles to fit the "bigger" world
 TILE_DEPTH         = 5
 MAP_W,    MAP_H    = 400, 400     # Much larger map
@@ -44,19 +44,42 @@ class WorldGenerator:
         self.style_idx = self._build_style_map()
 
     def _build_heightmap(self):
-        """Creates a jagged, mountainous base using power-scaled noise."""
-        hmap = np.zeros((self.height, self.width), dtype=np.float32)
-        octaves = 8
-        for octave in range(octaves):
-            freq = 0.02 * (2 ** octave)
-            amp = 0.6 / (1.5 ** octave)
-            # Using random offsets to simulate Perlin-ish noise with sine/cosine
-            off_x, off_y = self.rng.uniform(0, 1000, size=2)
-            hmap += amp * (np.sin(self.gx * freq + off_x) * np.cos(self.gy * freq + off_y))
-        
-        # Sharpen the terrain: push values to extremes to create basins and ridges
-        hmap = (hmap - hmap.min()) / (hmap.max() - hmap.min())
-        return np.power(hmap, 1.5) 
+            # 1. Initialize empty map
+            hmap = np.zeros((self.height, self.width), dtype=np.float32)
+            
+            # 2. Layer multiple "Octaves" of noise
+            # Lower octaves = big mountains; Higher octaves = small rocks/craters
+            octaves = 8
+            persistence = 0.5  # How much detail is added each layer
+            lacunarity = 2.0   # How much the frequency increases each layer
+            
+            amplitude = 1.0
+            frequency = 0.005 # Base scale
+            
+            for i in range(octaves):
+                # We use a randomized sine-wave composition to simulate Perlin noise
+                # Adding a random phase shift makes every seed unique
+                phase_x = self.rng.uniform(0, 1000)
+                phase_y = self.rng.uniform(0, 1000)
+                
+                layer = np.sin((self.gx * frequency) + phase_x) * \
+                        np.cos((self.gy * frequency) + phase_y)
+                
+                hmap += layer * amplitude
+                
+                # Prepare next octave
+                amplitude *= persistence
+                frequency *= lacunarity
+
+            # 3. Normalize to 0.0 - 1.0 range
+            hmap = (hmap - hmap.min()) / (hmap.max() - hmap.min())
+
+            # 4. THE LUNAR TOUCH: Apply a power function
+            # This pushes middle-ground values down, creating wide flat plains 
+            # and leaving only the highest points as sharp peaks.
+            hmap = np.power(hmap, 2.0) 
+
+            return hmap
 
     def _generate_craters(self, hmap, num_craters):
         """Carves circular depressions with raised rims into the map."""
