@@ -17,6 +17,7 @@ class Rover:
         
         self.dodged_obstacles = set()
         self.accumulated_cost = 0.0
+        self.traversed_path = [(int(round(self.gx)), int(round(self.gy)))]
         self.previous_node = (int(round(self.gx)), int(round(self.gy)))
 
     def set_path(self, path):
@@ -33,6 +34,7 @@ class Rover:
         
         self.dodged_obstacles = set()
         self.accumulated_cost = 0.0
+        self.traversed_path = [(int(round(self.gx)), int(round(self.gy)))]
         self.previous_node = (int(round(self.gx)), int(round(self.gy)))
 
     def scan_radar(self, object_map, known_object_map):
@@ -127,6 +129,7 @@ class Rover:
             if dist < self.speed:
                 self.accumulated_cost += calculate_path_cost(height_grid, [self.previous_node, (tx, ty)], roughness_grid=roughness_grid)
                 self.previous_node = (tx, ty)
+                self.traversed_path.append((int(tx), int(ty)))
                 
                 self.gx, self.gy = float(tx), float(ty)
                 self.target_index += 1

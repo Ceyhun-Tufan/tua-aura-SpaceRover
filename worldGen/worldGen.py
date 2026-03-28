@@ -450,7 +450,12 @@ def main():
                 remainder_path = rover.current_path[max(0, rover.target_index - 1):]
                 path_cost = rover.accumulated_cost + calculate_path_cost(grid_data, remainder_path, roughness_grid=world.roughness_map.tolist())
 
-        renderer.render(screen, hovered, path, start_node, end_node, rover, straight_path, dijkstra_path, path_cost, straight_cost, dijkstra_cost)
+        # Compute active full path to render preserving the traversal history
+        active_path = path
+        if rover and rover.current_path:
+            active_path = rover.traversed_path + rover.current_path[rover.target_index:]
+
+        renderer.render(screen, hovered, active_path, start_node, end_node, rover, straight_path, dijkstra_path, path_cost, straight_cost, dijkstra_cost)
         
         # UI
         path_len = len(path) if path is not None else 0
