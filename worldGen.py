@@ -21,7 +21,7 @@ COL_TILE_RIGHT = [(30, 33, 45), (25, 28, 38), (35, 38, 48), (22, 26, 35)]
 # WORLD GENERATOR
 # ══════════════════════════════════════════════════════════════════════════════
 class WorldGenerator:
-    HEIGHT_LEVELS = 30  # Increased for more verticality
+    HEIGHT_LEVELS = 50  # Increased for more verticality
     
     def __init__(self, width, height, seed=None):
         self.width  = width
@@ -213,6 +213,11 @@ class Camera:
 # ══════════════════════════════════════════════════════════════════════════════
 # MAIN LOOP
 # ══════════════════════════════════════════════════════════════════════════════
+
+def getWorld():
+    world = WorldGenerator(MAP_W,MAP_H)
+    return world
+
 def main():
     pygame.init()
     screen = pygame.display.set_mode((SCREEN_W, SCREEN_H))
