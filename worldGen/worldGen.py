@@ -1,28 +1,32 @@
 import pygame
 import numpy as np
-import sys
-import math
 from random import randint
+
 # ── Config ───────────────────────────────────────────────────────────────────
 SCREEN_W, SCREEN_H = 1280, 720
-TILE_W,   TILE_H   = 24, 12       # Smaller tiles to fit the "bigger" world
+TILE_W,   TILE_H   = 48, 24       # Standard tile size
 TILE_DEPTH         = 5
-MAP_W,    MAP_H    = 400, 400     # Much larger map
+MAP_W,    MAP_H    = 400, 400     # 400x400 Grid
 FPS                = 60
 
 # Moon colour palette
 COL_SKY        = (5, 8, 20)
-# Updated palette for style_idx 3 (Lowlands/Maria)
+# Index 0: Dust, 1: Highlands, 2: Peaks, 3: Maria (Basalt)
 COL_TILE_TOP   = [(80, 85, 100), (95, 100, 115), (120, 125, 140), (40, 42, 50)]
 COL_TILE_LEFT  = [(45, 48, 60), (38, 42, 55), (50, 54, 65), (35, 40, 52)]
 COL_TILE_RIGHT = [(30, 33, 45), (25, 28, 38), (35, 38, 48), (22, 26, 35)]
+
+# Object Types
+OBJ_EMPTY = 0
+OBJ_ROCK_SMALL = 1  # Rover can drive over
+OBJ_ROCK_LARGE = 2  # Obstacle
 
 # ══════════════════════════════════════════════════════════════════════════════
 # WORLD GENERATOR
 # ══════════════════════════════════════════════════════════════════════════════
 class WorldGenerator:
-    HEIGHT_LEVELS = 50  # Increased for more verticality
-    
+    HEIGHT_LEVELS = 50 
+
     def __init__(self, width, height, seed=None):
         self.width  = width
         self.height = height
@@ -31,137 +35,87 @@ class WorldGenerator:
 
         self.gx, self.gy = np.meshgrid(np.arange(width), np.arange(height))
         
-        # 1. Generate the base Perlin-like surface
+        # 1. Base Perlin Noise
         hmap = self._build_heightmap()
         
-        # 2. STAMP THE CRATERS HERE
-        hmap = self._add_craters(hmap, num_craters=250)
+        # 2. Add Craters
+        hmap = self._add_craters(hmap, num_craters=300)
         
-        # 3. Normalize and finalize
-        hmap = np.clip(hmap, 0, 1) # Ensure no heights go below 0 or above 1
+        # 3. Finalize Height
+        hmap = np.clip(hmap, 0, 1)
         self.heightmap = hmap
         self.height_steps = (self.heightmap * self.HEIGHT_LEVELS).astype(np.int32)
+        
+        # 4. Generate Styles and Object Matrix
         self.style_idx = self._build_style_map()
+        self.object_map = self._generate_objects()
 
-    def _add_craters(self, hmap, num_craters=100):
+    def _build_heightmap(self):
+        hmap = np.zeros((self.height, self.width), dtype=np.float32)
+        octaves = 8
+        persistence = 0.5
+        lacunarity = 2.0
+        amplitude = 1.0
+        frequency = 0.005 
+        
+        for i in range(octaves):
+            phase_x = self.rng.uniform(0, 1000)
+            phase_y = self.rng.uniform(0, 1000)
+            layer = np.sin((self.gx * frequency) + phase_x) * \
+                    np.cos((self.gy * frequency) + phase_y)
+            hmap += layer * amplitude
+            amplitude *= persistence
+            frequency *= lacunarity
+
+        hmap = (hmap - hmap.min()) / (hmap.max() - hmap.min())
+        return np.power(hmap, 2.0) # Creates the flat Maria basins
+
+    def _add_craters(self, hmap, num_craters):
         for _ in range(num_craters):
-            # 1. Randomize crater properties
-            cx = self.rng.integers(0, self.width)
-            cy = self.rng.integers(0, self.height)
-            radius = self.rng.uniform(3, 20)
+            cx, cy = self.rng.integers(0, self.width), self.rng.integers(0, self.height)
+            radius = self.rng.uniform(3, 18)
             depth = self.rng.uniform(0.1, 0.3)
 
-            # 2. Optimization: Only look at a small bounding box around the crater
             x0, x1 = max(0, int(cx - radius*2)), min(self.width, int(cx + radius*2))
             y0, y1 = max(0, int(cy - radius*2)), min(self.height, int(cy + radius*2))
             
-            # 3. Calculate distance from center for this local patch
             lx, ly = np.meshgrid(np.arange(x0, x1), np.arange(y0, y1))
             dist = np.sqrt((lx - cx)**2 + (ly - cy)**2)
-            r_dist = dist / radius  # Normalized distance (1.0 = at the rim)
+            r_dist = dist / radius
 
-            # 4. The "Bowl" and "Rim" Math
-            # Floor: A smooth parabolic dip inside the radius
             floor = np.where(r_dist < 1.0, -depth * (1 - r_dist**2), 0)
-            
-            # Rim: A sharp peak that happens exactly at the radius (r_dist = 1)
-            # We use a Gaussian curve to make the rim fall off quickly
             rim = (depth * 0.4) * np.exp(-10 * (r_dist - 1.0)**2)
-
-            # 5. Apply the crater to the heightmap patch
             hmap[y0:y1, x0:x1] += (floor + rim)
-
         return hmap
 
-    def _build_heightmap(self):
-            # 1. Initialize empty map
-            hmap = np.zeros((self.height, self.width), dtype=np.float32)
-            
-            # 2. Layer multiple "Octaves" of noise
-            # Lower octaves = big mountains; Higher octaves = small rocks/craters
-            octaves = 8
-            persistence = 0.5  # How much detail is added each layer
-            lacunarity = 2.0   # How much the frequency increases each layer
-            
-            amplitude = 1.0
-            frequency = 0.005 # Base scale
-            
-            for i in range(octaves):
-                # We use a randomized sine-wave composition to simulate Perlin noise
-                # Adding a random phase shift makes every seed unique
-                phase_x = self.rng.uniform(0, 1000)
-                phase_y = self.rng.uniform(0, 1000)
-                
-                layer = np.sin((self.gx * frequency) + phase_x) * \
-                        np.cos((self.gy * frequency) + phase_y)
-                
-                hmap += layer * amplitude
-                
-                # Prepare next octave
-                amplitude *= persistence
-                frequency *= lacunarity
-
-            # 3. Normalize to 0.0 - 1.0 range
-            hmap = (hmap - hmap.min()) / (hmap.max() - hmap.min())
-
-            # 4. THE LUNAR TOUCH: Apply a power function
-            # This pushes middle-ground values down, creating wide flat plains 
-            # and leaving only the highest points as sharp peaks.
-            hmap = np.power(hmap, 2.0) 
-
-            return hmap
-
-    def _generate_craters(self, hmap, num_craters):
-        """Carves circular depressions with raised rims into the map."""
-        for _ in range(num_craters):
-            # Random crater stats
-            cx = self.rng.integers(0, self.width)
-            cy = self.rng.integers(0, self.height)
-            radius = self.rng.uniform(2, 15)
-            depth = self.rng.uniform(0.1, 0.3)
-
-            # Calculate distance from crater center for every point in the map
-            # (Optimized via NumPy)
-            dist_sq = (self.gx - cx)**2 + (self.gy - cy)**2
-            dist = np.sqrt(dist_sq)
-            
-            # The Crater Formula:
-            # Inside the radius, it dips. At the radius, it peaks (the rim).
-            # We use a smoothstep-like function for the bowl and a Gaussian for the rim.
-            mask = dist <= radius * 2
-            if not np.any(mask): continue
-            
-            # Normalize distance relative to radius
-            r_dist = dist[mask] / radius
-            
-            # Crater Bowl (parabolic dip)
-            bowl = np.where(r_dist < 1.0, -depth * (1 - r_dist**2), 0)
-            
-            # Crater Rim (sharp peak at r=1.0)
-            rim = 0.15 * depth * np.exp(-5 * (r_dist - 1.0)**2)
-            
-            hmap[mask] += (bowl + rim)
-            
-        return hmap
+    def _generate_objects(self):
+        obj_map = np.zeros((self.height, self.width), dtype=np.int32)
+        # Scatter rocks based on terrain height
+        for _ in range(3000):
+            rx, ry = self.rng.integers(0, self.width), self.rng.integers(0, self.height)
+            h = self.heightmap[ry, rx]
+            if 0.3 < h < 0.8: # Likely highland dust areas
+                obj_map[ry, rx] = OBJ_ROCK_SMALL if self.rng.random() > 0.15 else OBJ_ROCK_LARGE
+        return obj_map
 
     def _build_style_map(self):
         h = self.heightmap
         idx = np.zeros((self.height, self.width), dtype=np.int32)
-        
-        # These thresholds determine where the 'dust' vs 'rock' is
-        idx[h > 0.40] = 1  # Standard Moon Dust
-        idx[h > 0.75] = 2  # Bright Highland Peaks
-        idx[h < 0.15] = 3  # Dark Basaltic Plains (Maria)
+        idx[h > 0.40] = 1 # Dust
+        idx[h > 0.75] = 2 # Highlands
+        idx[h < 0.15] = 3 # Maria
         return idx
 
 # ══════════════════════════════════════════════════════════════════════════════
-# WORLD RENDERER (Numpy Accelerated)
+# WORLD RENDERER
 # ══════════════════════════════════════════════════════════════════════════════
 class WorldRenderer:
     def __init__(self, world, camera):
-        self.world   = world
-        self.camera  = camera
-        self._tiles  = self._build_flat_tiles()
+        self.world = world
+        self.camera = camera
+        self._base_tiles = self._build_flat_tiles() 
+        self._scaled_tiles = []
+        self._last_zoom = -1.0
         self._star_bg = self._build_star_background(SCREEN_W, SCREEN_H)
         self._overlay = pygame.Surface((SCREEN_W, SCREEN_H), pygame.SRCALPHA)
 
@@ -178,14 +132,13 @@ class WorldRenderer:
         pygame.draw.polygon(surf, right_col, [(tw//2, th), (tw, th//2), (tw, th//2+TILE_DEPTH), (tw//2, th+TILE_DEPTH)])
         return surf
 
-    @staticmethod
-    def _build_star_background(w, h):
+    def _build_star_background(self, w, h):
         surf = pygame.Surface((w, h))
         surf.fill(COL_SKY)
         rng = np.random.default_rng(99)
         for _ in range(400):
             x, y = rng.integers(0, w), rng.integers(0, h)
-            col = rng.integers(150, 255)
+            val = rng.integers(150, 255)
             surf.set_at((x, y), COL_SKY)
         return surf
 
@@ -193,69 +146,92 @@ class WorldRenderer:
         screen.blit(self._star_bg, (0, 0))
         self._overlay.fill((0, 0, 0, 0))
 
-        # Vectorized Coordinate Projection
-        # (gx - gy) * half_w + offset
-        sx = (self.world.gx - self.world.gy) * (TILE_W // 2) + self.camera.ox
-        # (gx + gy) * half_h - depth + offset
-        sy = (self.world.gx + self.world.gy) * (TILE_H // 2) - (self.world.height_steps * TILE_DEPTH) + self.camera.oy
+        curr_zoom = self.camera.zoom
+        zw, zh, zd = int(TILE_W * curr_zoom), int(TILE_H * curr_zoom), int(TILE_DEPTH * curr_zoom)
 
-        # Frustum Culling: Create a boolean mask of tiles inside the screen
-        margin = TILE_W * 2
-        visible_mask = (sx > -margin) & (sx < SCREEN_W + margin) & \
-                       (sy > -margin) & (sy < SCREEN_H + margin)
+        if curr_zoom != self._last_zoom:
+            self._scaled_tiles = [pygame.transform.scale(t, (zw, zh + zd)) for t in self._base_tiles]
+            self._last_zoom = curr_zoom
 
-        # Draw only visible tiles (Painter's algorithm: iterate Y then X)
-        visible_indices = np.argwhere(visible_mask)
+        sx = (self.world.gx - self.world.gy) * (zw // 2) + self.camera.ox
+        sy = (self.world.gx + self.world.gy) * (zh // 2) - (self.world.height_steps * zd) + self.camera.oy
+
+        margin = zw * 2
+        visible_mask = (sx > -margin) & (sx < SCREEN_W + margin) & (sy > -margin) & (sy < SCREEN_H + margin)
+        indices = np.argwhere(visible_mask)
         
-        for y, x in visible_indices:
+        for y, x in indices:
+            # 1. Draw Tile
             sidx = self.world.style_idx[y, x]
-            # Offset tile by half width to center it on the coordinate
-            screen.blit(self._tiles[sidx], (sx[y, x] - TILE_W // 2, sy[y, x]))
+            screen.blit(self._scaled_tiles[sidx], (sx[y, x] - zw // 2, sy[y, x]))
 
+            # 2. Draw Rocks
+            obj = self.world.object_map[y, x]
+            if obj != OBJ_EMPTY:
+                self._draw_rock(screen, sx[y, x], sy[y, x], zw, zh, obj)
+
+            # 3. Hover
             if (x, y) == hovered:
-                self._draw_hover(sx[y, x], sy[y, x], self.world.height_steps[y, x])
+                self._draw_hover(sx[y, x], sy[y, x], zw, zh)
 
         screen.blit(self._overlay, (0, 0))
 
-    def _draw_hover(self, sx, sy, hz):
-        pts = [(sx, sy + TILE_H//2), (sx + TILE_W//2, sy), (sx, sy - TILE_H//2), (sx - TILE_W//2, sy)]
+    def _draw_rock(self, screen, sx, sy, zw, zh, obj_type):
+        color = (100, 105, 120) if obj_type == OBJ_ROCK_SMALL else (70, 75, 90)
+        size = 0.2 if obj_type == OBJ_ROCK_SMALL else 0.45
+        rw, rh = zw * size, zh * size
+        bx, by = sx, sy + (zh // 4)
+        pts = [(bx - rw//2, by), (bx, by - rh), (bx + rw//2, by + rh//4), (bx, by + rh//2)]
+        pygame.draw.polygon(screen, color, pts)
+        pygame.draw.polygon(screen, (10, 10, 20), pts, 1)
+
+    def _draw_hover(self, sx, sy, zw, zh):
+        pts = [(sx, sy + zh//2), (sx + zw//2, sy), (sx, sy - zh//2), (sx - zw//2, sy)]
         pygame.draw.polygon(self._overlay, (200, 230, 255, 150), pts, 2)
 
 # ══════════════════════════════════════════════════════════════════════════════
-# CAMERA & INPUT
+# CAMERA
 # ══════════════════════════════════════════════════════════════════════════════
 class Camera:
     def __init__(self):
         self.ox, self.oy = SCREEN_W // 2, SCREEN_H // 4
-        self.speed = 10
+        self.speed = 12
+        self.zoom = 1.0
+        self.min_zoom, self.max_zoom = 0.3, 4.0
 
     def move(self, dx, dy):
         self.ox += dx
         self.oy += dy
 
+    def adjust_zoom(self, delta, center):
+        old_zoom = self.zoom
+        self.zoom = max(self.min_zoom, min(self.max_zoom, self.zoom + delta))
+        ratio = self.zoom / old_zoom
+        self.ox = center[0] - (center[0] - self.ox) * ratio
+        self.oy = center[1] - (center[1] - self.oy) * ratio
+
     def screen_to_world(self, sx, sy):
-        # Inverse isometric projection
+        zw, zh = TILE_W * self.zoom, TILE_H * self.zoom
         rel_x, rel_y = sx - self.ox, sy - self.oy
-        gx = (rel_x / (TILE_W // 2) + rel_y / (TILE_H // 2)) / 2
-        gy = (rel_y / (TILE_H // 2) - rel_x / (TILE_W // 2)) / 2
+        gx = (rel_x / (zw / 2) + rel_y / (zh / 2)) / 2
+        gy = (rel_y / (zh / 2) - rel_x / (zw / 2)) / 2
         return int(round(gx)), int(round(gy))
 
 # ══════════════════════════════════════════════════════════════════════════════
-# MAIN LOOP
+# MAIN
 # ══════════════════════════════════════════════════════════════════════════════
 
 def getWorld():
-    world = WorldGenerator(MAP_W,MAP_H)
-    return world
+    return WorldGenerator(MAP_W,MAP_H)
 
 def main():
     pygame.init()
     screen = pygame.display.set_mode((SCREEN_W, SCREEN_H))
-    clock  = pygame.time.Clock()
-    font   = pygame.font.SysFont("monospace", 14, bold=True)
+    pygame.display.set_caption("Lunar Rover Simulation World")
+    clock, font = pygame.time.Clock(), pygame.font.SysFont("monospace", 14, bold=True)
 
-    world    = WorldGenerator(MAP_W, MAP_H)
-    camera   = Camera()
+    world = WorldGenerator(MAP_W, MAP_H)
+    camera = Camera()
     renderer = WorldRenderer(world, camera)
 
     running = True
@@ -263,27 +239,35 @@ def main():
         clock.tick(FPS)
         for event in pygame.event.get():
             if event.type == pygame.QUIT: running = False
+            if event.type == pygame.MOUSEBUTTONDOWN:
+                if event.button == 4: camera.adjust_zoom(0.1, pygame.mouse.get_pos())
+                if event.button == 5: camera.adjust_zoom(-0.1, pygame.mouse.get_pos())
 
-        # Camera Pan
         keys = pygame.key.get_pressed()
         if keys[pygame.K_a]: camera.move(camera.speed, 0)
         if keys[pygame.K_d]: camera.move(-camera.speed, 0)
         if keys[pygame.K_w]: camera.move(0, camera.speed)
         if keys[pygame.K_s]: camera.move(0, -camera.speed)
 
-        # Mouse Interaction
         mx, my = pygame.mouse.get_pos()
         hovered = camera.screen_to_world(mx, my)
 
         renderer.render(screen, hovered)
         
-        # UI
-        fps_text = font.render(f"FPS: {int(clock.get_fps())} | Pos: {hovered}", True, (0, 255, 0))
-        screen.blit(fps_text, (10, 10))
+        # Simple UI
+        ui_bg = pygame.Surface((300, 60), pygame.SRCALPHA)
+        ui_bg.fill((0, 0, 0, 150))
+        screen.blit(ui_bg, (0, 0))
+        
+        info = f"FPS: {int(clock.get_fps())} | Zoom: {camera.zoom:.1f}"
+        pos_info = f"Map Pos: {hovered}"
+        screen.blit(font.render(info, True, (0, 255, 0)), (10, 10))
+        screen.blit(font.render(pos_info, True, (0, 255, 0)), (10, 30))
         
         pygame.display.flip()
-
     pygame.quit()
+
+
 
 if __name__ == "__main__":
     main()
