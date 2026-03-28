@@ -8,6 +8,7 @@ import pygame
 import numpy as np
 from random import randint
 from pathFinding.pathFinding import astar
+from rover.rover import Rover
 
 # --- Config (Same as yours) ---
 SCREEN_W, SCREEN_H = 1920, 1080
@@ -87,9 +88,31 @@ class Camera:
         self.ox = center[0] - (center[0] - self.ox) * ratio
         self.oy = center[1] - (center[1] - self.oy) * ratio
 
-    def screen_to_world(self, sx, sy):
-        zw, zh = TILE_W * self.zoom, TILE_H * self.zoom
-        rx, ry = sx - self.ox, sy - self.oy
+    def screen_to_world(self, mx, my, world):
+        z = self.zoom
+        zw, zh, zd = int(TILE_W*z), int(TILE_H*z), int(TILE_DEPTH*z)
+        
+        # Calculate screen center coordinates for all tiles
+        sx = (world.gx - world.gy) * (zw//2) + self.ox
+        sy = (world.gx + world.gy) * (zh//2) - (world.height_steps * zd) + self.oy
+        
+        # The true top face center is offset by zh//2
+        cx = sx
+        cy = sy + zh//2
+        
+        # Check inside the isometric diamond mathematically
+        dx = np.abs(mx - cx) / (zw/2)
+        dy = np.abs(my - cy) / (zh/2)
+        inside = (dx + dy) <= 1.0
+        
+        valid_indices = np.argwhere(inside)
+        if len(valid_indices) > 0:
+            # Pick the tile rendered last (front-most)
+            best = valid_indices[-1]
+            return int(best[1]), int(best[0]) # (x, y)
+            
+        # Fallback to flat Z=0 plane if clicking outside any valid raised face
+        rx, ry = mx - self.ox, my - self.oy
         gx = (rx / (zw/2) + ry / (zh/2)) / 2
         gy = (ry / (zh/2) - rx / (zw/2)) / 2
         return int(round(gx)), int(round(gy))
@@ -109,7 +132,7 @@ class WorldRenderer:
         pygame.draw.polygon(s, r, [(TILE_W//2, TILE_H), (TILE_W, TILE_H//2), (TILE_W, TILE_H//2+5), (TILE_W//2, TILE_H+5)])
         return s
 
-    def render(self, screen, hovered, path, start_node, end_node):
+    def render(self, screen, hovered, path, start_node, end_node, rover=None):
         screen.blit(self._star_bg, (0, 0))
         self._overlay.fill((0, 0, 0, 0))
         
@@ -149,6 +172,30 @@ class WorldRenderer:
         if path and len(path) > 1:
             self._draw_connected_path(path, zw, zh, zd)
 
+        # 6. Draw Rover
+        if rover:
+            rsx = (rover.gx - rover.gy) * (zw // 2) + self.camera.ox
+            rx_int, ry_int = int(round(rover.gx)), int(round(rover.gy))
+            rover_zd = 0
+            if 0 <= ry_int < self.world.height and 0 <= rx_int < self.world.width:
+                rover_zd = self.world.height_steps[ry_int, rx_int] * zd
+            
+            rsy = (rover.gx + rover.gy) * (zh // 2) - rover_zd + self.camera.oy
+            
+            # Subtle radar cone visualization
+            if rover.state == "MOVING" and rover.current_path:
+                cone_pts = [(rsx, rsy)]
+                look_limit = min(rover.target_index + rover.radar_range, len(rover.current_path))
+                for i in range(rover.target_index, look_limit):
+                    tx, ty = rover.current_path[i]
+                    tsx = (tx - ty) * (zw // 2) + self.camera.ox
+                    tsy = (tx + ty) * (zh // 2) - (self.world.height_steps[ty, tx] * zd) + self.camera.oy
+                    cone_pts.append((tsx, tsy))
+                if len(cone_pts) > 1:
+                    pygame.draw.lines(self._overlay, (0, 255, 255, 60), False, cone_pts, 4)
+
+            self._draw_rover(screen, rsx, rsy, zw, zh)
+
         screen.blit(self._overlay, (0, 0))
 
     def _draw_rock(self, screen, sx, sy, zw, zh, obj_type):
@@ -158,6 +205,18 @@ class WorldRenderer:
         bx, by = sx, sy + zh//4
         pts = [(bx-rw//2, by), (bx, by-rh), (bx+rw//2, by+rh//4), (bx, by+rh//2)]
         pygame.draw.polygon(screen, color, pts); pygame.draw.polygon(screen, (10,10,20), pts, 1)
+
+    def _draw_rover(self, screen, rsx, rsy, zw, zh):
+        """Draws the rover as a distinct golden object."""
+        rw, rh = zw * 0.4, zh * 0.4
+        bx, by = rsx, rsy - rh//2
+        pts = [(bx - rw // 2, by), (bx, by - rh), (bx + rw // 2, by), (bx, by + rh)]
+        pygame.draw.polygon(screen, (255, 200, 50), pts)
+        pygame.draw.polygon(screen, (200, 150, 0), pts, 2)
+        
+        # Draw a tiny solar panel / antenna
+        pygame.draw.line(screen, (150, 150, 150), (bx, by - rh), (bx, by - rh - 10), 2)
+        pygame.draw.circle(screen, (0, 255, 255), (bx, int(by - rh - 10)), 3)
 
     def _draw_node(self, sx, sy, zw, zh, color, label=""):
         # Create a pulsing effect using pygame.time
@@ -224,6 +283,7 @@ def main():
     start_node = None
     end_node = None
     path = []
+    rover = None
 
     running = True
     while running:
@@ -233,7 +293,7 @@ def main():
             
             if event.type == pygame.MOUSEBUTTONDOWN:
                 mx, my = pygame.mouse.get_pos()
-                grid_pos = camera.screen_to_world(mx, my)
+                grid_pos = camera.screen_to_world(mx, my, world)
                 
                 if event.button == 1: # Left Click: Start
                     start_node = grid_pos
@@ -242,9 +302,15 @@ def main():
                     end_node = grid_pos
                     # Calculate Path
                     if start_node and end_node:
-                        # Convert numpy grid to list for the astar function
-                        grid_data = world.height_steps.tolist()
-                        path = astar(grid_data, start_node, end_node)
+                        world_w, world_h = world.width, world.height
+                        if (0 <= start_node[0] < world_w and 0 <= start_node[1] < world_h and 
+                            0 <= end_node[0] < world_w and 0 <= end_node[1] < world_h):
+                            
+                            # Convert numpy grid to list for the astar function
+                            grid_data = world.height_steps.tolist()
+                            path = astar(grid_data, start_node, end_node)
+                            rover = Rover(start_node)
+                            rover.set_path(path)
                 
                 if event.button == 4: camera.adjust_zoom(0.1, (mx, my))
                 if event.button == 5: camera.adjust_zoom(-0.1, (mx, my))
@@ -256,9 +322,15 @@ def main():
         if keys[pygame.K_s]: camera.move(0, -camera.speed)
 
         mx, my = pygame.mouse.get_pos()
-        hovered = camera.screen_to_world(mx, my)
+        hovered = camera.screen_to_world(mx, my, world)
 
-        renderer.render(screen, hovered, path, start_node, end_node)
+        # Update Rover
+        if rover:
+            grid_data = world.height_steps.tolist()
+            obj_data = world.object_map.tolist()
+            rover.update(grid_data, obj_data)
+
+        renderer.render(screen, hovered, path, start_node, end_node, rover)
         
         # UI
         path_len = len(path) if path is not None else 0

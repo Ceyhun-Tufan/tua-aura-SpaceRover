@@ -32,15 +32,17 @@ def astar(
     height_grid: list[list[int]],
     start: tuple[int, int],
     goal:  tuple[int, int],
+    object_grid: list[list[int]] | None = None
 ) -> list[tuple[int, int]] | None:
     """
-    Yükseklik haritası üzerinde en düşük maliyetli yolu bulur.
+    Yükseklik haritası üzerinde en düşük maliyetli yolu bulur. Opsiyonel olarak engelleri (0'dan farklı değerleri) önleyebilir.
 
     Parametreler
     ────────────
     height_grid : 2D liste — height_grid[y][x] (int yükseklik değerleri)
     start       : (x, y)  başlangıç koordinatı
     goal        : (x, y)  hedef koordinatı
+    object_grid : 2D liste (isteğe bağlı) — object_grid[y][x], engelleri temsil eder (0 boş)
 
     Döndürür
     ────────
@@ -82,6 +84,9 @@ def astar(
         for dx, dy, base_cost in _NEIGHBOURS:
             nx, ny = cx + dx, cy + dy
             if not (0 <= nx < cols and 0 <= ny < rows):
+                continue
+
+            if object_grid is not None and object_grid[ny][nx] != 0:
                 continue
 
             dh = height_grid[ny][nx] - ch                 # pozitif = yokuş yukarı
