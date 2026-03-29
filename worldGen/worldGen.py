@@ -30,7 +30,7 @@ OBJ_EMPTY, OBJ_ROCK_SMALL, OBJ_ROCK_LARGE = 0, 1, 2
 
 class WorldGenerator:
     HEIGHT_LEVELS = 70
-    def __init__(self, width, height, seed=80368):
+    def __init__(self, width, height, seed=80368): # world seed is important
         self.width, self.height = width, height
         self.seed = seed if seed is not None else randint(0, 100000)
 
@@ -184,7 +184,7 @@ class WorldGenerator:
         if save_dir is None:
             save_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         os.makedirs(save_dir, exist_ok=True)
-        filepath = os.path.join(save_dir, f"{self.seed}.txt")
+        filepath = os.path.join(save_dir, f"saved/{self.seed}.txt")
 
         ys, xs = np.where(self.object_map > 0)
         rocks = list(zip(xs.tolist(), ys.tolist(), self.object_map[ys, xs].tolist()))
