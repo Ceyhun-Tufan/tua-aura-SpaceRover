@@ -30,9 +30,18 @@ OBJ_EMPTY, OBJ_ROCK_SMALL, OBJ_ROCK_LARGE = 0, 1, 2
 
 class WorldGenerator:
     HEIGHT_LEVELS = 70
-    def __init__(self, width, height, seed=None):
+    def __init__(self, width, height, seed=80368):
         self.width, self.height = width, height
         self.seed = seed if seed is not None else randint(0, 100000)
+
+        # ── Check for an existing save file BEFORE doing any heavy generation ──
+        _root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        _save_path = os.path.join(_root, f"{self.seed}.txt")
+        if os.path.exists(_save_path):
+            self._load_data_from_file(_save_path)
+            return   # skip generation entirely
+
+        # ── Generate world from scratch ─────────────────────────────────
         self.rng = np.random.default_rng(self.seed)
         self.gx, self.gy = np.meshgrid(np.arange(width), np.arange(height))
         hmap = self._build_heightmap()
@@ -43,6 +52,9 @@ class WorldGenerator:
         self.style_idx = self._build_style_map()
         self.object_map = self._generate_objects()
         self.known_object_map = np.zeros((self.height, self.width), dtype=np.int32)
+
+        # ── Performance caches (static for the lifetime of the world) ────────
+        self._build_caches()
 
     def _build_heightmap(self):
         hmap = np.zeros((self.height, self.width), dtype=np.float32)
@@ -94,24 +106,138 @@ class WorldGenerator:
         idx[self.heightmap > 0.40] = 1
         idx[self.heightmap > 0.75] = 2
         idx[self.heightmap < 0.15] = 3
-        
-        # If roughness > 0.6, shift to rough texture variations (+4 shift)
         idx[self.roughness_map > 0.6] += 4
         return idx
+
+    def _build_caches(self):
+        """Pre-compute performance-critical static arrays (call after all grids are ready)."""
+        self._iso_dx = (self.gx - self.gy).astype(np.int32)
+        self._iso_dy = (self.gx + self.gy).astype(np.int32)
+        self.height_steps_list  = self.height_steps.tolist()
+        self.roughness_map_list = self.roughness_map.tolist()
+
+    def _load_data_from_file(self, filepath):
+        """Populate all world arrays from a previously saved .txt file."""
+        with open(filepath, 'r') as f:
+            lines = f.readlines()
+
+        # ── Parse header ─────────────────────────────────────────────────
+        for line in lines:
+            if line.startswith("Width:"):         self.width  = int(line.split(":")[1].strip())
+            elif line.startswith("Height:") and "Levels" not in line:
+                                                  self.height = int(line.split(":")[1].strip())
+
+        self.gx, self.gy = np.meshgrid(np.arange(self.width), np.arange(self.height))
+
+        # ── Parse sections ───────────────────────────────────────────────
+        section = None
+        hmap_rows, rmap_rows, objects = [], [], []
+        for line in lines:
+            stripped = line.rstrip()
+            if stripped.startswith("[HEIGHTMAP]"):   section = "h"
+            elif stripped.startswith("[ROUGHNESS]") and "STATS" not in stripped: section = "r"
+            elif stripped.startswith("[OBJECTS]"):   section = "o"
+            elif stripped.startswith("["):           section = None
+            elif not stripped or stripped.startswith("#"): continue
+            elif section == "h":
+                hmap_rows.append(list(map(int, stripped.split())))
+            elif section == "r":
+                rmap_rows.append([v / 10000.0 for v in map(int, stripped.split())])
+            elif section == "o":
+                parts = stripped.split()
+                if len(parts) == 3 and parts[0].isdigit():
+                    objects.append((int(parts[0]), int(parts[1]), int(parts[2])))
+
+        # ── Reconstruct numpy arrays ─────────────────────────────────────────
+        self.height_steps  = np.array(hmap_rows, dtype=np.int32)
+        self.heightmap     = (self.height_steps / self.HEIGHT_LEVELS).astype(np.float32)
+
+        if rmap_rows and len(rmap_rows) == self.height:
+            self.roughness_map = np.array(rmap_rows, dtype=np.float32)
+        else:
+            # Old save file (no [ROUGHNESS] section) — regenerate from seed so the
+            # style map and pathfinding costs are still correct, then re-save.
+            print("  (old format — regenerating roughness from seed and re-saving)")
+            self.rng = np.random.default_rng(self.seed)
+            # Advance RNG past heightmap (8 oct × 2) and craters (800 × 4) calls
+            _ = [self.rng.uniform(0, 1000) for _ in range(16)]
+            _ = [(self.rng.integers(0, 2), self.rng.exponential(), self.rng.uniform())
+                 for _ in range(800)]
+            self.roughness_map = self._build_roughness_map()
+            self._regen_roughness = True   # flag save_to_file to overwrite
+
+        self.style_idx = self._build_style_map()
+
+        self.object_map = np.zeros((self.height, self.width), dtype=np.int32)
+        for x, y, t in objects:
+            if 0 <= y < self.height and 0 <= x < self.width:
+                self.object_map[y, x] = t
+
+        self.known_object_map = np.zeros((self.height, self.width), dtype=np.int32)
+        self._build_caches()
+        self._loaded_from_file = True
+        print(f"World loaded  <- {filepath}")
+
+
+    def save_to_file(self, save_dir=None):
+        """Save world data to '{seed}.txt' in the project root (or save_dir)."""
+        if save_dir is None:
+            save_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        os.makedirs(save_dir, exist_ok=True)
+        filepath = os.path.join(save_dir, f"{self.seed}.txt")
+
+        ys, xs = np.where(self.object_map > 0)
+        rocks = list(zip(xs.tolist(), ys.tolist(), self.object_map[ys, xs].tolist()))
+        rough_int = (self.roughness_map * 10000).astype(np.int32)
+
+        with open(filepath, 'w') as f:
+            f.write("=== SpaceRover World Save ===\n")
+            f.write(f"Seed:          {self.seed}\n")
+            f.write(f"Width:         {self.width}\n")
+            f.write(f"Height:        {self.height}\n")
+            f.write(f"Height Levels: {self.HEIGHT_LEVELS}\n")
+            f.write(f"Rock Count:    {len(rocks)}\n\n")
+
+            f.write("[HEIGHTMAP]  # rows of space-separated int height values (0-70)\n")
+            for row in self.height_steps.tolist():
+                f.write(' '.join(map(str, row)) + '\n')
+
+            f.write("\n[ROUGHNESS]  # values ×10000 as ints for lossless reload\n")
+            for row in rough_int.tolist():
+                f.write(' '.join(map(str, row)) + '\n')
+
+            f.write("\n[OBJECTS]  # x y type  (1=small rock, 2=large rock)\n")
+            for x, y, t in rocks:
+                f.write(f"{x} {y} {t}\n")
+
+        print(f"World saved   -> {filepath}")
+        return filepath
 
 class Camera:
     def __init__(self):
         self.ox, self.oy = SCREEN_W // 2, SCREEN_H // 4
         self.speed, self.zoom = 12, 1.0
-        self.min_zoom, self.max_zoom = 0.3, 4.0
+        self.min_zoom, self.max_zoom = 0.04, 4.0
 
     def move(self, dx, dy): self.ox += dx; self.oy += dy
     def adjust_zoom(self, delta, center):
-        old = self.zoom
-        self.zoom = max(self.min_zoom, min(self.max_zoom, self.zoom + delta))
-        ratio = self.zoom / old
-        self.ox = center[0] - (center[0] - self.ox) * ratio
-        self.oy = center[1] - (center[1] - self.oy) * ratio
+        """Multiplicative zoom: each tick scales by a fixed ratio so it feels
+        consistent at every zoom level. Pivot is kept under the mouse cursor."""
+        factor = 1.15 if delta > 0 else (1.0 / 1.15)
+        new_zoom = max(self.min_zoom, min(self.max_zoom, self.zoom * factor))
+        if new_zoom == self.zoom:
+            return
+        # Use the same integer-truncated tile sizes the renderer will use, so
+        # the pivot point (tile under cursor) doesn't drift.
+        old_half_zw = int(TILE_W * self.zoom) // 2
+        new_half_zw = int(TILE_W * new_zoom)  // 2
+        old_half_zh = int(TILE_H * self.zoom) // 2
+        new_half_zh = int(TILE_H * new_zoom)  // 2
+        ratio_w = new_half_zw / max(old_half_zw, 1)
+        ratio_h = new_half_zh / max(old_half_zh, 1)
+        self.ox = center[0] - (center[0] - self.ox) * ratio_w
+        self.oy = center[1] - (center[1] - self.oy) * ratio_h
+        self.zoom = new_zoom
 
     def screen_to_world(self, mx, my, world):
         z = self.zoom
@@ -156,9 +282,26 @@ class WorldRenderer:
             
         self._scaled_tiles, self._last_zoom = [], -1.0
         self._scaled_rocks = {}
-        self._star_bg = pygame.Surface((SCREEN_W, SCREEN_H)); self._star_bg.fill(COL_SKY)
+
+        # Background image — load felfena.jpeg from the project root
+        _root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        _bg_path = os.path.join(_root, "felfena.jpeg")
+        try:
+            _raw = pygame.image.load(_bg_path).convert()
+            self._star_bg = pygame.transform.scale(_raw, (SCREEN_W, SCREEN_H))
+        except Exception:
+            self._star_bg = pygame.Surface((SCREEN_W, SCREEN_H))
+            self._star_bg.fill(COL_SKY)
+
         self._overlay = pygame.Surface((SCREEN_W, SCREEN_H), pygame.SRCALPHA)
         self.font = pygame.font.SysFont("monospace", 14, bold=True)
+        # Per-zoom projection cache — recomputed only when zoom changes
+        self._sx_base: np.ndarray | None = None  # iso_dx * (zw//2)
+        self._sy_base: np.ndarray | None = None  # iso_dy * (zh//2) - height_steps * zd
+        # Dark curtain drawn between the JPEG background and the tiles so that
+        # transparent SRCALPHA tile corners show dark space, not the photo.
+        self._bg_curtain = pygame.Surface((SCREEN_W, SCREEN_H), pygame.SRCALPHA)
+        self._bg_curtain.fill((5, 8, 20, 210))   # very dark, ~82 % opaque
 
     def _make_tile(self, t, l, r, is_rough=False):
         s = pygame.Surface((TILE_W, TILE_H + TILE_DEPTH), pygame.SRCALPHA)
@@ -187,11 +330,16 @@ class WorldRenderer:
 
     def render(self, screen, hovered, path, start_node, end_node, rover=None, straight_path=None, dijkstra_path=None, path_cost=0.0, straight_cost=0.0, dijkstra_cost=0.0):
         screen.blit(self._star_bg, (0, 0))
+        # Dark curtain: tile transparent corners show this dark layer, not the JPEG
+        screen.blit(self._bg_curtain, (0, 0))
         self._overlay.fill((0, 0, 0, 0))
         
         z = self.camera.zoom
-        zw, zh, zd = int(TILE_W*z), int(TILE_H*z), int(TILE_DEPTH*z)
-        
+        zw  = max(2, int(TILE_W * z))   # floor at 2 so surfaces are never 0-sized
+        zh  = max(1, int(TILE_H * z))   # floor at 1
+        zd  = max(0, int(TILE_DEPTH * z))
+        half_zw, half_zh = zw >> 1, zh >> 1
+
         if z != self._last_zoom:
             self._scaled_tiles = [pygame.transform.scale(t, (zw, zh+zd)) for t in self._base_tiles]
             self._scaled_rocks = {
@@ -199,36 +347,55 @@ class WorldRenderer:
                 2: self._make_rock_surf(zw, zh, 2)
             }
             self._last_zoom = z
+            # Recompute static projection bases (camera-offset is added per-frame below)
+            self._sx_base = self.world._iso_dx * half_zw
+            self._sy_base = self.world._iso_dy * (half_zh) - self.world.height_steps * zd
 
-        # Calculate all screen positions at once
-        sx = (self.world.gx - self.world.gy) * (zw//2) + self.camera.ox
-        sy = (self.world.gx + self.world.gy) * (zh//2) - (self.world.height_steps * zd) + self.camera.oy
-        
+        # Per-frame: add integer camera offset to static bases (2 numpy ops vs 4 before)
+        ox_i = int(self.camera.ox)
+        oy_i = int(self.camera.oy)
+        sx = self._sx_base + ox_i
+        sy = self._sy_base + oy_i
+
+        # Visibility cull
         vis = (sx > -zw*2) & (sx < SCREEN_W+zw*2) & (sy > -zh*2) & (sy < SCREEN_H+zh*2)
+
+        # ── BATCH index all needed data for visible tiles in one numpy call each ──
+        vis_yx   = np.argwhere(vis)
+        if len(vis_yx):
+            vy, vx           = vis_yx[:, 0], vis_yx[:, 1]
+            vis_sx           = sx[vy, vx].tolist()       # batch → Python ints
+            vis_sy           = sy[vy, vx].tolist()
+            vis_style        = self.world.style_idx[vy, vx].tolist()
+            vis_obj          = self.world.known_object_map[vy, vx].tolist()
+
+            scaled_tiles = self._scaled_tiles
+            scaled_rocks = self._scaled_rocks
+            blit_seq     = []
+            for i in range(len(vis_sx)):
+                blit_seq.append((scaled_tiles[vis_style[i]], (vis_sx[i] - half_zw, vis_sy[i])))
+                if vis_obj[i]:
+                    blit_seq.append((scaled_rocks[vis_obj[i]], (vis_sx[i] - half_zw, vis_sy[i] - half_zh)))
+            screen.blits(blit_seq)
+
+        # ── Path trail dots: iterate path nodes, not all vis tiles ──────────
         path_set = set(path) if path else set()
+        for (px, py) in path_set:
+            if (px, py) != start_node and (px, py) != end_node:
+                if vis[py, px]:
+                    self._draw_path_trail(sx[py, px], sy[py, px], zw, zh)
 
-        blit_seq = []
+        # ── Markers: look up screen pos directly, no vis scan needed ────────
+        def _node_screen(node):
+            nx, ny = node
+            return sx[ny, nx], sy[ny, nx]
 
-        # 1 & 2: Build bulk sequence for Tiles and Objects to draw simultaneously respecting Depth 
-        for y, x in np.argwhere(vis):
-            blit_seq.append((self._scaled_tiles[self.world.style_idx[y,x]], (sx[y,x]-zw//2, sy[y,x])))
-            
-            obj = self.world.known_object_map[y,x]
-            if obj != 0: # OBJ_EMPTY is 0
-                blit_seq.append((self._scaled_rocks[obj], (sx[y,x]-zw//2, sy[y,x]-zh//2)))
-                
-        # Fire bulk draw command (C-Accelerated, exponentially faster than Python loop blits)
-        screen.blits(blit_seq)
-
-        # Draw overlays (Paths, Holograms) separately
-        for y, x in np.argwhere(vis):
-            if (x, y) in path_set and (x, y) != start_node and (x, y) != end_node:
-                self._draw_path_trail(sx[y,x], sy[y,x], zw, zh)
-
-            if (x, y) == start_node:
-                self._draw_marker(sx[y,x], sy[y,x], zw, zh, (0, 255, 150), "START")
-            elif (x, y) == end_node:
-                self._draw_marker(sx[y,x], sy[y,x], zw, zh, (255, 50, 50), "TARGET")
+        if start_node:
+            nsx, nsy = _node_screen(start_node)
+            self._draw_marker(nsx, nsy, zw, zh, (0, 255, 150), "START")
+        if end_node:
+            nsx, nsy = _node_screen(end_node)
+            self._draw_marker(nsx, nsy, zw, zh, (255, 50, 50), "TARGET")
 
         # 5. Draw Connected Path Line (A*)
         if path and len(path) > 1:
@@ -421,6 +588,9 @@ def main():
     clock, font = pygame.time.Clock(), pygame.font.SysFont("monospace", 14, bold=True)
 
     world = WorldGenerator(MAP_W, MAP_H)
+    # Save only when freshly generated or when an old-format file was upgraded
+    if getattr(world, '_regen_roughness', False) or not getattr(world, '_loaded_from_file', False):
+        world.save_to_file()
     camera = Camera()
     renderer = WorldRenderer(world, camera)
 
@@ -517,15 +687,15 @@ def main():
 
         # Update Rover
         if rover:
-            grid_data = world.height_steps.tolist()
-            # Pass ground truth, the mutable known_map memory, and the roughness grid directly
-            rover.update(grid_data, world.object_map, world.known_object_map, world.roughness_map.tolist())
-            
+            # Use the cached Python-list copies — no .tolist() allocation every frame
+            grid_data  = world.height_steps_list
+            rough_data = world.roughness_map_list
+            rover.update(grid_data, world.object_map, world.known_object_map, rough_data)
+
             # Recalculate active path cost dynamically
             if rover.state == "MOVING" and rover.current_path:
-                # Use the actual logical departure node to prevent float rounding errors triggering artificial cliff penalties
                 remainder_path = rover.current_path[max(0, rover.target_index - 1):]
-                path_cost = rover.accumulated_cost + calculate_path_cost(grid_data, remainder_path, roughness_grid=world.roughness_map.tolist())
+                path_cost = rover.accumulated_cost + calculate_path_cost(grid_data, remainder_path, roughness_grid=rough_data)
 
         # Compute active full path to render preserving the traversal history
         active_path = path
