@@ -6,12 +6,13 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import pygame
 import numpy as np
+import time
 from random import randint
 from pathFinding.pathFinding import astar, dijkstra, get_straight_line, calculate_path_cost
 from rover.rover import Rover
 
 # --- Config (Same as yours) ---
-SCREEN_W, SCREEN_H = 1920, 1080
+SCREEN_W, SCREEN_H = 1280, 720
 TILE_W,   TILE_H   = 48, 24
 TILE_DEPTH         = 5
 MAP_W,    MAP_H    = 400, 400 
@@ -364,9 +365,59 @@ class WorldRenderer:
         pygame.draw.rect(screen, (0, 0, 0, 150), bg_rect, border_radius=4)
         screen.blit(surface, rect)
 
+    def _draw_text_left(self, screen, text, x, y, color):
+        surface = self.font.render(text, True, color)
+        rect = surface.get_rect(topleft=(x, y))
+        bg_rect = rect.inflate(8, 4)
+        bg_rect.topleft = (x - 4, y - 2)
+        pygame.draw.rect(screen, (0, 0, 0, 150), bg_rect, border_radius=4)
+        screen.blit(surface, rect)
+
+    def _draw_stats_table(self, screen, x, base_y, headers, rows, highlight_idx=-1):
+        col_widths = []
+        for c in range(len(headers)):
+            w = max([self.font.size(headers[c])[0]] + [self.font.size(str(row[c]))[0] for row in rows])
+            col_widths.append(w + 30)
+
+        row_h = 25
+        total_w = sum(col_widths)
+        total_h = (len(rows) + 1) * row_h
+        y = base_y - total_h
+        
+        s = pygame.Surface((total_w, total_h), pygame.SRCALPHA)
+        pygame.draw.rect(s, (0, 0, 0, 200), (0, 0, total_w, total_h), border_radius=6)
+        screen.blit(s, (x, y))
+        pygame.draw.rect(screen, (100, 100, 150), (x, y, total_w, total_h), width=2, border_radius=6)
+        
+        cx = x
+        for c, header in enumerate(headers):
+            surf = self.font.render(header, True, (150, 200, 255))
+            screen.blit(surf, (cx + 15, y + 5))
+            cx += col_widths[c]
+            
+        pygame.draw.line(screen, (100, 100, 150), (x, y + row_h), (x + total_w, y + row_h), 2)
+        
+        for r_idx, row in enumerate(rows):
+            ry = y + (r_idx + 1) * row_h
+            cx = x
+            if highlight_idx == r_idx:
+                s_hl = pygame.Surface((total_w - 4, row_h), pygame.SRCALPHA)
+                s_hl.fill((0, 255, 100, 40))
+                screen.blit(s_hl, (x + 2, ry))
+                
+            for c, cell in enumerate(row):
+                color = (255, 255, 255)
+                if highlight_idx == r_idx: color = (100, 255, 100)
+                surf = self.font.render(str(cell), True, color)
+                screen.blit(surf, (cx + 15, ry + 5))
+                cx += col_widths[c]
+
 def main():
     pygame.init()
-    screen = pygame.display.set_mode((SCREEN_W, SCREEN_H))
+    try:
+        screen = pygame.display.set_mode((SCREEN_W, SCREEN_H), pygame.SCALED | pygame.RESIZABLE)
+    except:
+        screen = pygame.display.set_mode((SCREEN_W, SCREEN_H))
     clock, font = pygame.time.Clock(), pygame.font.SysFont("monospace", 14, bold=True)
 
     world = WorldGenerator(MAP_W, MAP_H)
@@ -381,6 +432,9 @@ def main():
     path_cost = 0.0
     dijkstra_cost = 0.0
     straight_cost = 0.0
+    astar_time = 0.0
+    dijkstra_time = 0.0
+    straight_time = 0.0
     rover = None
 
     running = True
@@ -409,13 +463,24 @@ def main():
                             known_grid = world.known_object_map.tolist()
                             rough_grid = world.roughness_map.tolist()
                             
+                            t0 = time.perf_counter()
                             path = astar(grid_data, start_node, end_node, object_grid=known_grid, roughness_grid=rough_grid)
+                            t1 = time.perf_counter()
                             dijkstra_path = dijkstra(grid_data, start_node, end_node, object_grid=known_grid, roughness_grid=rough_grid)
+                            t2 = time.perf_counter()
+                            
+                            astar_time = (t1 - t0) * 1000
+                            dijkstra_time = (t2 - t1) * 1000
                             
                             if path or dijkstra_path:
                                 path_cost = calculate_path_cost(grid_data, path, roughness_grid=rough_grid) if path else float('inf')
                                 dijkstra_cost = calculate_path_cost(grid_data, dijkstra_path, roughness_grid=rough_grid) if dijkstra_path else float('inf')
+                                
+                                t3 = time.perf_counter()
                                 straight_path = get_straight_line(start_node[0], start_node[1], end_node[0], end_node[1])
+                                t4 = time.perf_counter()
+                                straight_time = (t4 - t3) * 1000
+                                
                                 straight_cost = calculate_path_cost(grid_data, straight_path, roughness_grid=rough_grid)
                                 
                                 rover = Rover(start_node)
@@ -467,6 +532,31 @@ def main():
             f"End: {end_node}", 
             f"Path Length: {path_len}"
         ]
+        
+        for i, text in enumerate(ui):
+            renderer._draw_text_left(screen, text, 10, 10 + i * 25, (255, 255, 255))
+            
+        if start_node and end_node:
+            headers = ["Algorithm", "Cost", "Time(ms)", "Length", "Nodes/ms"]
+            
+            def calc_nodes_ms(length, ms):
+                if ms <= 0.01: return "N/A"
+                return f"{int(length / ms)}"
+
+            rows = [
+                ["A*", f"{path_cost:.1f}", f"{astar_time:.2f}", f"{len(path) if path else 0}", calc_nodes_ms(len(path) if path else 0, astar_time)],
+                ["Dijkstra", f"{dijkstra_cost:.1f}", f"{dijkstra_time:.2f}", f"{len(dijkstra_path) if dijkstra_path else 0}", calc_nodes_ms(len(dijkstra_path) if dijkstra_path else 0, dijkstra_time)],
+                ["Straight", f"{straight_cost:.1f}", f"{straight_time:.2f}", f"{len(straight_path) if straight_path else 0}", "N/A"]
+            ]
+            
+            highlight_idx = -1
+            if path_cost <= dijkstra_cost and path:
+                highlight_idx = 0
+            elif dijkstra_path:
+                highlight_idx = 1
+                
+            renderer._draw_stats_table(screen, 15, SCREEN_H - 50, headers, rows, highlight_idx)
+
         pygame.display.flip()
     pygame.quit()
 
