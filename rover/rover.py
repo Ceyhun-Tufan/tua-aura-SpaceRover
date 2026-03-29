@@ -136,3 +136,15 @@ class Rover:
             else:
                 self.gx += (dx / dist) * self.speed
                 self.gy += (dy / dist) * self.speed
+
+    def restore_state(self, data):
+        """Restores the rover's physical state from a dictionary."""
+        self.gx = float(data.get('gx', self.gx))
+        self.gy = float(data.get('gy', self.gy))
+        self.accumulated_cost = float(data.get('cost', self.accumulated_cost))
+        self.traversed_path = data.get('traversed', self.traversed_path)
+        self.current_path = data.get('path', self.current_path)
+        self.global_path = data.get('path', self.global_path)
+        self.target_index = int(data.get('target_idx', self.target_index))
+        self.state = data.get('state', self.state)
+        self.previous_node = (int(round(self.gx)), int(round(self.gy)))

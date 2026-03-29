@@ -6,6 +6,7 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import pygame
 import numpy as np
+import os
 import time
 from random import randint
 from pathFinding.pathFinding import astar, dijkstra, get_straight_line, calculate_path_cost
@@ -36,7 +37,7 @@ class WorldGenerator:
 
         # ── Check for an existing save file BEFORE doing any heavy generation ──
         _root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        _save_path = os.path.join(_root, f"{self.seed}.txt")
+        _save_path = os.path.join(_root, f"saved/{self.seed}.txt")
         if os.path.exists(_save_path):
             self._load_data_from_file(_save_path)
             return   # skip generation entirely
@@ -131,22 +132,46 @@ class WorldGenerator:
 
         # ── Parse sections ───────────────────────────────────────────────
         section = None
-        hmap_rows, rmap_rows, objects = [], [], []
+        hmap_rows, rmap_rows, objects, known_objects = [], [], [], []
+        rover_data = {}
+        
         for line in lines:
             stripped = line.rstrip()
+            if not stripped or stripped.startswith("#"): continue
+            
             if stripped.startswith("[HEIGHTMAP]"):   section = "h"
-            elif stripped.startswith("[ROUGHNESS]") and "STATS" not in stripped: section = "r"
+            elif stripped.startswith("[ROUGHNESS]"):   section = "r"
             elif stripped.startswith("[OBJECTS]"):   section = "o"
+            elif stripped.startswith("[KNOWN_OBJECTS]"): section = "k"
+            elif stripped.startswith("[ROVER_STATE]"): section = "rs"
             elif stripped.startswith("["):           section = None
-            elif not stripped or stripped.startswith("#"): continue
             elif section == "h":
                 hmap_rows.append(list(map(int, stripped.split())))
             elif section == "r":
                 rmap_rows.append([v / 10000.0 for v in map(int, stripped.split())])
             elif section == "o":
                 parts = stripped.split()
-                if len(parts) == 3 and parts[0].isdigit():
-                    objects.append((int(parts[0]), int(parts[1]), int(parts[2])))
+                if len(parts) == 3: objects.append((int(parts[0]), int(parts[1]), int(parts[2])))
+            elif section == "k":
+                parts = stripped.split()
+                if len(parts) == 3: known_objects.append((int(parts[0]), int(parts[1]), int(parts[2])))
+            elif section == "rs":
+                if ":" in stripped:
+                    key, val = stripped.split(":", 1)
+                    key, val = key.strip(), val.strip()
+                    if key in ["gx", "gy", "cost"]: rover_data[key] = float(val)
+                    elif key == "target_idx": rover_data[key] = int(val)
+                    elif key == "state": rover_data[key] = val
+                    elif key == "traversed":
+                        pts = []
+                        for p in val.split():
+                            if "," in p: pts.append(tuple(map(int, p.split(","))))
+                        rover_data[key] = pts
+                    elif key == "current_path":
+                        pts = []
+                        for p in val.split():
+                            if "," in p: pts.append(tuple(map(int, p.split(","))))
+                        rover_data["path"] = pts
 
         # ── Reconstruct numpy arrays ─────────────────────────────────────────
         self.height_steps  = np.array(hmap_rows, dtype=np.int32)
@@ -155,16 +180,13 @@ class WorldGenerator:
         if rmap_rows and len(rmap_rows) == self.height:
             self.roughness_map = np.array(rmap_rows, dtype=np.float32)
         else:
-            # Old save file (no [ROUGHNESS] section) — regenerate from seed so the
-            # style map and pathfinding costs are still correct, then re-save.
-            print("  (old format — regenerating roughness from seed and re-saving)")
+            # Fallback for old/missing roughness
+            print("  (regenerating roughness from seed)")
             self.rng = np.random.default_rng(self.seed)
-            # Advance RNG past heightmap (8 oct × 2) and craters (800 × 4) calls
             _ = [self.rng.uniform(0, 1000) for _ in range(16)]
-            _ = [(self.rng.integers(0, 2), self.rng.exponential(), self.rng.uniform())
-                 for _ in range(800)]
+            _ = [(self.rng.integers(0, 2), self.rng.exponential(), self.rng.uniform()) for _ in range(800)]
             self.roughness_map = self._build_roughness_map()
-            self._regen_roughness = True   # flag save_to_file to overwrite
+            self._regen_roughness = True
 
         self.style_idx = self._build_style_map()
 
@@ -174,20 +196,29 @@ class WorldGenerator:
                 self.object_map[y, x] = t
 
         self.known_object_map = np.zeros((self.height, self.width), dtype=np.int32)
+        for x, y, t in known_objects:
+            if 0 <= y < self.height and 0 <= x < self.width:
+                self.known_object_map[y, x] = t
+
         self._build_caches()
         self._loaded_from_file = True
+        self.saved_rover_data = rover_data
         print(f"World loaded  <- {filepath}")
 
 
-    def save_to_file(self, save_dir=None):
+    def save_to_file(self, save_dir=None, rover=None):
         """Save world data to '{seed}.txt' in the project root (or save_dir)."""
         if save_dir is None:
             save_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        os.makedirs(save_dir, exist_ok=True)
+        os.makedirs(os.path.join(save_dir, "saved"), exist_ok=True)
         filepath = os.path.join(save_dir, f"saved/{self.seed}.txt")
 
         ys, xs = np.where(self.object_map > 0)
         rocks = list(zip(xs.tolist(), ys.tolist(), self.object_map[ys, xs].tolist()))
+        
+        kys, kxs = np.where(self.known_object_map > 0)
+        known_rocks = list(zip(kxs.tolist(), kys.tolist(), self.known_object_map[kys, kxs].tolist()))
+        
         rough_int = (self.roughness_map * 10000).astype(np.int32)
 
         with open(filepath, 'w') as f:
@@ -210,7 +241,25 @@ class WorldGenerator:
             for x, y, t in rocks:
                 f.write(f"{x} {y} {t}\n")
 
-        print(f"World saved   -> {filepath}")
+            f.write("\n[KNOWN_OBJECTS]  # x y type\n")
+            for x, y, t in known_rocks:
+                f.write(f"{x} {y} {t}\n")
+
+            if rover:
+                f.write("\n[ROVER_STATE]\n")
+                f.write(f"gx: {rover.gx:.4f}\n")
+                f.write(f"gy: {rover.gy:.4f}\n")
+                f.write(f"cost: {rover.accumulated_cost:.4f}\n")
+                f.write(f"target_idx: {rover.target_index}\n")
+                f.write(f"state: {rover.state}\n")
+                
+                traversed_str = " ".join([f"{x},{y}" for x, y in rover.traversed_path])
+                f.write(f"traversed: {traversed_str}\n")
+                
+                path_str = " ".join([f"{x},{y}" for x, y in rover.current_path])
+                f.write(f"current_path: {path_str}\n")
+
+        # print(f"World saved   -> {filepath}") # Silenced for periodic saves
         return filepath
 
 class Camera:
@@ -605,13 +654,35 @@ def main():
     astar_time = 0.0
     dijkstra_time = 0.0
     straight_time = 0.0
+    
     rover = None
+    # ── Restore Rover from Save ──────────────────────────────────────────
+    if hasattr(world, 'saved_rover_data') and world.saved_rover_data:
+        data = world.saved_rover_data
+        rover = Rover((data.get('gx', 0), data.get('gy', 0)))
+        rover.restore_state(data)
+        # Restore nodes for UI consistency
+        if rover.current_path:
+            start_node = rover.current_path[0]
+            end_node = rover.current_path[-1]
+            path = rover.current_path
+        print(f"Rover restored at ({rover.gx:.1f}, {rover.gy:.1f})")
+
+    last_save_time = time.time()
+    SAVE_INTERVAL = 30 # seconds
 
     running = True
     while running:
+        # Periodic Auto-save
+        if time.time() - last_save_time > SAVE_INTERVAL:
+            world.save_to_file(rover=rover)
+            last_save_time = time.time()
+
         clock.tick(FPS)
         for event in pygame.event.get():
-            if event.type == pygame.QUIT: running = False
+            if event.type == pygame.QUIT:
+                world.save_to_file(rover=rover) # Final save on exit
+                running = False
             
             if event.type == pygame.MOUSEBUTTONDOWN:
                 mx, my = pygame.mouse.get_pos()
