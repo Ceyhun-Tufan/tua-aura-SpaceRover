@@ -11,9 +11,10 @@ import time
 from random import randint
 from pathFinding.pathFinding import astar, dijkstra, get_straight_line, calculate_path_cost
 from rover.rover import Rover
+import math
 
 # --- Config (Same as yours) ---
-SCREEN_W, SCREEN_H = 1280, 720
+SCREEN_W, SCREEN_H = 1920, 1080
 TILE_W,   TILE_H   = 48, 24
 TILE_DEPTH         = 5
 MAP_W,    MAP_H    = 400, 400 
@@ -56,6 +57,45 @@ class WorldGenerator:
 
         # ── Performance caches (static for the lifetime of the world) ────────
         self._build_caches()
+
+    def _calculate_terrain_lighting(self):
+        """Calculates a combined slope-based shading and AO (cavity) map."""
+        h = self.heightmap
+        
+        # 1. Slope-based Shading (Lambertian-like)
+        # Gradient using Sobel-like central difference
+        # We use a 1-pixel pad to maintain size
+        hp = np.pad(h, 1, mode='edge')
+        dzdx = (hp[1:-1, 2:] - hp[1:-1, :-2]) * 5.0
+        dzdy = (hp[2:, 1:-1] - hp[:-2, 1:-1]) * 5.0
+        
+        # Light source from Top-Left (North-West)
+        # Isometric light vector: -1, -1, 1 (normalized later)
+        lx, ly, lz = -0.6, -0.6, 1.0
+        mag = np.sqrt(dzdx**2 + dzdy**2 + 1.0)
+        nx, ny, nz = -dzdx/mag, -dzdy/mag, 1.0/mag
+        
+        # Dot product with light
+        shading = nx*lx + ny*ly + nz*lz
+        shading = (shading - shading.min()) / (shading.max() - shading.min() + 1e-6)
+        
+        # 2. Faux Ambient Occlusion (Cavity Map)
+        # Simple local average comparison using numpy slicing for convolution
+        # We need a 3x3 average (box blur)
+        # Pad heightmap for boundaries
+        h_pad = np.pad(h, 1, mode='edge')
+        avg_h = (
+            h_pad[:-2, :-2] + h_pad[:-2, 1:-1] + h_pad[:-2, 2:] +
+            h_pad[1:-1, :-2] +                  h_pad[1:-1, 2:] +
+            h_pad[2:, :-2] + h_pad[2:, 1:-1] + h_pad[2:, 2:]
+        ) / 8.0
+        
+        cavity = np.clip((h - avg_h) * 10.0 + 0.5, 0.0, 1.0)
+        
+        # 3. Combine: AO reinforces the shading
+        # We want deep pits to be dark even if they face the sun
+        combined = shading * 0.7 + cavity * 0.3
+        return np.clip(combined, 0.0, 1.0)
 
     def _build_heightmap(self):
         hmap = np.zeros((self.height, self.width), dtype=np.float32)
@@ -116,6 +156,11 @@ class WorldGenerator:
         self._iso_dy = (self.gx + self.gy).astype(np.int32)
         self.height_steps_list  = self.height_steps.tolist()
         self.roughness_map_list = self.roughness_map.tolist()
+        
+        # Calculate lighting once and cache it
+        self.shading_map = self._calculate_terrain_lighting()
+        # Quantize shading into 16 levels (0-15) for tile indexing
+        self.shading_levels = (self.shading_map * 15).astype(np.int32)
 
     def _load_data_from_file(self, filepath):
         """Populate all world arrays from a previously saved .txt file."""
@@ -322,15 +367,25 @@ class WorldRenderer:
         self.world, self.camera = world, camera
         
         self._base_tiles = []
-        # Index 0-3: Smooth Textures
-        for i in range(4):
-            self._base_tiles.append(self._make_tile(COL_TILE_TOP[i], COL_TILE_LEFT[i], COL_TILE_RIGHT[i], is_rough=False))
-        # Index 4-7: Rough/Gritty Textures
-        for i in range(4):
-            self._base_tiles.append(self._make_tile(COL_TILE_TOP[i], COL_TILE_LEFT[i], COL_TILE_RIGHT[i], is_rough=True))
+        # Index 0-3: Style 0-3 Smooth
+        # Index 4-7: Style 0-3 Rough
+        # We now generate 16 shading levels for EACH style.
+        # Total tiles: (4 styles * 2 roughness) * 16 levels = 128 base tiles
+        for rough in [False, True]:
+            for style in range(4):
+                for level in range(16):
+                    brightness = 0.5 + (level / 15.0) * 0.8 # 0.5 to 1.3 range
+                    self._base_tiles.append(self._make_tile(
+                        COL_TILE_TOP[style], COL_TILE_LEFT[style], COL_TILE_RIGHT[style], 
+                        is_rough=rough, brightness=brightness
+                    ))
             
         self._scaled_tiles, self._last_zoom = [], -1.0
         self._scaled_rocks = {}
+        
+        # Particles
+        self._particles = [] # List of [x, y, vx, vy, life, color]
+        self._last_particle_time = 0
 
         # Background image — load felfena.jpeg from the project root
         _root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -352,30 +407,95 @@ class WorldRenderer:
         self._bg_curtain = pygame.Surface((SCREEN_W, SCREEN_H), pygame.SRCALPHA)
         self._bg_curtain.fill((5, 8, 20, 210))   # very dark, ~82 % opaque
 
-    def _make_tile(self, t, l, r, is_rough=False):
+    def _make_tile(self, t, l, r, is_rough=False, brightness=1.0):
+        # Apply brightness multiplier to colors
+        def mult(c, b): return tuple(max(0, min(255, int(ch * b))) for ch in c)
+        t, l, r = mult(t, brightness), mult(l, brightness), mult(r, brightness)
+        
         s = pygame.Surface((TILE_W, TILE_H + TILE_DEPTH), pygame.SRCALPHA)
         pygame.draw.polygon(s, t, [(TILE_W//2, 0), (TILE_W, TILE_H//2), (TILE_W//2, TILE_H), (0, TILE_H//2)])
         
+        # Add grainy texture noise (very fast drawing of 1x1 pixels)
+        # We do this once per cached tile, so it's free at runtime.
+        import random
+        for _ in range(40):
+            nx, ny = random.randint(0, TILE_W-1), random.randint(0, TILE_H-1)
+            # Only draw noise if it's inside the top diamond
+            dx = abs(nx - TILE_W//2) / (TILE_W/2)
+            dy = abs(ny - TILE_H//2) / (TILE_H/2)
+            if dx + dy <= 1.0:
+                noise_col = (0, 0, 0, 40) if random.random() > 0.5 else (255, 255, 255, 20)
+                s.set_at((nx, ny), noise_col)
+
         if is_rough:
-            import random
-            for _ in range(15):
-                dx = random.randint(TILE_W//4, TILE_W - TILE_W//4)
-                dy = random.randint(TILE_H//4, TILE_H - TILE_H//4)
-                pygame.draw.line(s, (20, 20, 25, 120), (dx, dy), (dx+1, dy))
+            for _ in range(12):
+                dx = random.randint(TILE_W//6, TILE_W - TILE_W//6)
+                dy = random.randint(TILE_H//6, TILE_H - TILE_H//6)
+                # Ensure we only draw inside the tile diamond by checking bounds
+                dist_x = abs(dx - TILE_W//2) / (TILE_W/2)
+                dist_y = abs(dy - TILE_H//2) / (TILE_H/2)
+                if dist_x + dist_y <= 0.8: # stay slightly inside
+                    # Shadow/Base of pebble
+                    size = random.randint(1, 2)
+                    pygame.draw.circle(s, (20, 20, 25, 180), (dx, dy), size)
+                    # Tiny highlight on top-left of the pebble
+                    pygame.draw.line(s, (120, 125, 140, 100), (dx, dy), (dx, dy))
                 
-        pygame.draw.polygon(s, l, [(0, TILE_H//2), (TILE_W//2, TILE_H), (TILE_W//2, TILE_H+5), (0, TILE_H//2+5)])
-        pygame.draw.polygon(s, r, [(TILE_W//2, TILE_H), (TILE_W, TILE_H//2), (TILE_W, TILE_H//2+5), (TILE_W//2, TILE_H+5)])
+        # Draw sides
+        pygame.draw.polygon(s, l, [(0, TILE_H//2), (TILE_W//2, TILE_H), (TILE_W//2, TILE_H+TILE_DEPTH), (0, TILE_H//2+TILE_DEPTH)])
+        pygame.draw.polygon(s, r, [(TILE_W//2, TILE_H), (TILE_W, TILE_H//2), (TILE_W, TILE_H//2+TILE_DEPTH), (TILE_W//2, TILE_H+TILE_DEPTH)])
         return s
 
-    def _make_rock_surf(self, zw, zh, obj_type):
-        surf = pygame.Surface((zw, zh), pygame.SRCALPHA)
-        color = (100,105,120) if obj_type==1 else (70,75,90)
-        sz = 0.2 if obj_type==1 else 0.45
-        rw, rh = zw*sz, zh*sz
-        bx, by = zw//2, zh//2 + zh//4
-        pts = [(bx-rw//2, by), (bx, by-rh), (bx+rw//2, by+rh//4), (bx, by+rh//2)]
-        pygame.draw.polygon(surf, color, pts); pygame.draw.polygon(surf, (10,10,20), pts, 1)
+    def _make_rock_surf(self, original_zw, original_zh, obj_type):
+        # We want rocks to look more "rocky"
+        # zw, zh is the scaled tile size
+        surf = pygame.Surface((original_zw, original_zh), pygame.SRCALPHA)
+        color = (130, 135, 150) if obj_type == 1 else (90, 95, 110)
+        sz = 0.25 if obj_type == 1 else 0.5
+        rw, rh = original_zw * sz, original_zh * sz
+        bx, by = original_zw // 2, original_zh // 2 + original_zh // 4
+        
+        # More complex rock shape (jittered polygon)
+        import random
+        pts = []
+        num_pts = 6 if obj_type == 1 else 9
+        for i in range(num_pts):
+            angle = (i / num_pts) * 2 * 3.14159
+            rv = random.uniform(0.7, 1.2)
+            px = bx + math.cos(angle) * rw * 0.5 * rv
+            py = by + math.sin(angle) * rh * 0.5 * rv - (rh * 0.5 if i < num_pts//2 else 0)
+            pts.append((px, py))
+            
+        pygame.draw.polygon(surf, color, pts)
+        # Highlight and shadow
+        pygame.draw.polygon(surf, (min(255, color[0]+30), min(255, color[1]+30), min(255, color[2]+30)), pts, 2)
+        pygame.draw.polygon(surf, (0, 0, 0, 100), pts, 1)
         return surf
+
+    def _update_particles(self, surf, ox, oy, zw, zh):
+        new_p = []
+        for p in self._particles:
+            # p: [gx, gy, gz, vx, vy, vz, life, color]
+            p[0] += p[3]; p[1] += p[4]; p[2] += p[5]
+            p[6] -= 0.05 # life
+            if p[6] > 0.01:
+                psx = (p[0] - p[1]) * (zw // 2) + ox
+                psy = (p[0] + p[1]) * (zh // 2) - (p[2]) + oy
+                size = int(p[6] * 3) + 1
+                alpha = max(0, min(255, int(p[6] * 255)))
+                color = (*p[7], alpha)
+                pygame.draw.circle(surf, color, (int(psx), int(psy)), size)
+                new_p.append(p)
+        self._particles = new_p
+
+    def add_dust(self, gx, gy, gz, amount=1):
+        import random
+        for _ in range(amount):
+            vx, vy = random.uniform(-0.02, 0.02), random.uniform(-0.02, 0.02)
+            vz = random.uniform(2, 5) # upward pop
+            life = random.uniform(0.5, 1.2)
+            col = (150, 150, 160) if random.random() > 0.5 else (100, 100, 110)
+            self._particles.append([gx, gy, gz, vx, vy, vz, life, col])
 
     def render(self, screen, hovered, path, start_node, end_node, rover=None, straight_path=None, dijkstra_path=None, path_cost=0.0, straight_cost=0.0, dijkstra_cost=0.0):
         screen.blit(self._star_bg, (0, 0))
@@ -390,7 +510,7 @@ class WorldRenderer:
         half_zw, half_zh = zw >> 1, zh >> 1
 
         if z != self._last_zoom:
-            self._scaled_tiles = [pygame.transform.scale(t, (zw, zh+zd)) for t in self._base_tiles]
+            self._scaled_tiles = [pygame.transform.scale(t, (zw, zh + zd)) for t in self._base_tiles]
             self._scaled_rocks = {
                 1: self._make_rock_surf(zw, zh, 1),
                 2: self._make_rock_surf(zw, zh, 2)
@@ -399,6 +519,13 @@ class WorldRenderer:
             # Recompute static projection bases (camera-offset is added per-frame below)
             self._sx_base = self.world._iso_dx * half_zw
             self._sy_base = self.world._iso_dy * (half_zh) - self.world.height_steps * zd
+            # Cache the shading level indices too (pre-calculate final blit index)
+            # base_index = (rough_offset * 4 + style_idx) * 16 + shading_level
+            # In worldGen: style_idx is 0-3 for smooth, 4-7 for rough (style + 4)
+            # So: index = (style_idx % 4 + (4 if style_idx >= 4 else 0)) * 16 + shading_levels
+            rough_part = (self.world.style_idx >= 4).astype(np.int32) * 64
+            style_part = (self.world.style_idx % 4) * 16
+            self._tile_blit_indices = (rough_part + style_part + self.world.shading_levels).astype(np.int32)
 
         # Per-frame: add integer camera offset to static bases (2 numpy ops vs 4 before)
         ox_i = int(self.camera.ox)
@@ -415,17 +542,20 @@ class WorldRenderer:
             vy, vx           = vis_yx[:, 0], vis_yx[:, 1]
             vis_sx           = sx[vy, vx].tolist()       # batch → Python ints
             vis_sy           = sy[vy, vx].tolist()
-            vis_style        = self.world.style_idx[vy, vx].tolist()
+            vis_tile_ptr     = self._tile_blit_indices[vy, vx].tolist() 
             vis_obj          = self.world.known_object_map[vy, vx].tolist()
 
             scaled_tiles = self._scaled_tiles
             scaled_rocks = self._scaled_rocks
             blit_seq     = []
             for i in range(len(vis_sx)):
-                blit_seq.append((scaled_tiles[vis_style[i]], (vis_sx[i] - half_zw, vis_sy[i])))
+                blit_seq.append((scaled_tiles[vis_tile_ptr[i]], (vis_sx[i] - half_zw, vis_sy[i])))
                 if vis_obj[i]:
                     blit_seq.append((scaled_rocks[vis_obj[i]], (vis_sx[i] - half_zw, vis_sy[i] - half_zh)))
             screen.blits(blit_seq)
+            
+        # Draw Particles
+        self._update_particles(self._overlay, ox_i, oy_i, zw, zh)
 
         # ── Path trail dots: iterate path nodes, not all vis tiles ──────────
         path_set = set(path) if path else set()
@@ -511,16 +641,42 @@ class WorldRenderer:
     # Replaced _draw_rock manual polygon rasterization into cached _make_rock_surf
 
     def _draw_rover(self, screen, rsx, rsy, zw, zh):
-        """Draws the rover as a distinct golden object."""
-        rw, rh = zw * 0.4, zh * 0.4
-        bx, by = rsx, rsy - rh//2
-        pts = [(bx - rw // 2, by), (bx, by - rh), (bx + rw // 2, by), (bx, by + rh)]
-        pygame.draw.polygon(screen, (255, 200, 50), pts)
-        pygame.draw.polygon(screen, (200, 150, 0), pts, 2)
+        """Draws a more detailed, shaded rover with an animated antenna."""
+        rw, rh = zw * 0.5, zh * 0.5
+        bx, by = rsx, rsy - rh * 0.4
         
-        # Draw a tiny solar panel / antenna
-        pygame.draw.line(screen, (150, 150, 150), (bx, by - rh), (bx, by - rh - 10), 2)
-        pygame.draw.circle(screen, (0, 255, 255), (bx, int(by - rh - 10)), 3)
+        # 1. Main Body (Metallic/Golden Box)
+        # We'll draw 3 faces for the box too
+        bw, bh = rw * 0.8, rh * 0.6
+        pts_top = [(bx, by - bh), (bx + bw//2, by - bh//2), (bx, by), (bx - bw//2, by - bh//2)]
+        pts_left = [(bx - bw//2, by - bh//2), (bx, by), (bx, by + bh//2), (bx - bw//2, by)]
+        pts_right = [(bx + bw//2, by - bh//2), (bx, by), (bx, by + bh//2), (bx + bw//2, by)]
+        
+        pygame.draw.polygon(screen, (255, 215, 100), pts_top)
+        pygame.draw.polygon(screen, (200, 160, 40), pts_left)
+        pygame.draw.polygon(screen, (160, 120, 20), pts_right)
+        pygame.draw.polygon(screen, (50, 40, 10), pts_top, 1)
+        
+        # 2. Wheels / Suspension
+        for i, (ox, oy) in enumerate([(-bw//2, 0), (bw//2, 0), (0, bh//4)]):
+            pygame.draw.circle(screen, (40, 40, 45), (int(bx + ox), int(by + oy + bh//4)), int(bw//6))
+            pygame.draw.circle(screen, (20, 20, 25), (int(bx + ox), int(by + oy + bh//4)), int(bw//6), 1)
+
+        # 3. Animated Antenna / Radar Dish
+        t = pygame.time.get_ticks() * 0.004
+        angle = math.sin(t) * 0.5
+        ax, ay = bx, by - bh
+        alen = bh * 1.2
+        # Draw antenna mast
+        pygame.draw.line(screen, (180, 180, 190), (ax, ay), (ax, ay - alen * 0.6), 2)
+        # Draw "Dish" at the end
+        dish_x = ax + math.cos(angle - 1.57) * (alen * 0.4)
+        dish_y = ay - alen * 0.6 + math.sin(angle - 1.57) * (alen * 0.4)
+        pygame.draw.line(screen, (0, 255, 255), (ax, ay - alen * 0.6), (dish_x, dish_y), 3)
+        pygame.draw.circle(screen, (0, 255, 255), (int(dish_x), int(dish_y)), 3)
+        # Small pulsing light
+        if int(t * 2) % 2 == 0:
+            pygame.draw.circle(screen, (255, 50, 50), (int(ax), int(ay - alen * 0.5)), 2)
 
     def _draw_node(self, sx, sy, zw, zh, color, label=""):
         # Create a pulsing effect using pygame.time
@@ -550,6 +706,11 @@ class WorldRenderer:
         pygame.draw.polygon(self._overlay, (*color, 60), pts)
         pygame.draw.polygon(self._overlay, (*color, 200), pts, 2)
         
+        # Subtle Bloom (Double draw with alpha)
+        for r in range(4):
+            bloom_pts = [(p[0], p[1]-r) for p in pts]
+            pygame.draw.polygon(self._overlay, (*color, 40 // (r+1)), bloom_pts, 1)
+
         # Floating "Hologram" Diamond
         off = 15 + pulse
         float_pts = [(sx, sy + zh//2 - off), (sx + zw//2, sy - off), 
@@ -761,7 +922,18 @@ def main():
             # Use the cached Python-list copies — no .tolist() allocation every frame
             grid_data  = world.height_steps_list
             rough_data = world.roughness_map_list
+            
+            old_gx, old_gy = rover.gx, rover.gy
             rover.update(grid_data, world.object_map, world.known_object_map, rough_data)
+            
+            # Trigger dust if moved
+            if (abs(rover.gx - old_gx) > 0.01 or abs(rover.gy - old_gy) > 0.01):
+                rx_int, ry_int = int(round(rover.gx)), int(round(rover.gy))
+                rz = 0
+                if 0 <= ry_int < world.height and 0 <= rx_int < world.width:
+                    # TILE_DEPTH * zoom * height_steps
+                    rz = world.height_steps[ry_int, rx_int] * (int(TILE_DEPTH * camera.zoom))
+                renderer.add_dust(rover.gx, rover.gy, rz, amount=1)
 
             # Recalculate active path cost dynamically
             if rover.state == "MOVING" and rover.current_path:
@@ -781,6 +953,7 @@ def main():
         ui = [
             f"FPS: {int(clock.get_fps())}", 
             f"Zoom: {camera.zoom:.1f}", 
+            f"Rover Speed: {rover.current_speed:.2f}" if rover else "Rover Speed: 0.00",
             f"Start: {start_node}", 
             f"End: {end_node}", 
             f"Path Length: {path_len}"

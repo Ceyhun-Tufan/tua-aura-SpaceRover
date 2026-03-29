@@ -14,6 +14,7 @@ class Rover:
         
         self.radar_range = 4 # How many tiles ahead to check
         self.state = "IDLE"
+        self.current_speed = 0.0 # For UI telemetrics
         
         self.dodged_obstacles = set()
         self.accumulated_cost = 0.0
@@ -134,8 +135,23 @@ class Rover:
                 self.gx, self.gy = float(tx), float(ty)
                 self.target_index += 1
             else:
-                self.gx += (dx / dist) * self.speed
-                self.gy += (dy / dist) * self.speed
+                # Calculate movement penalty based on local roughness
+                rx_int, ry_int = int(round(self.gx)), int(round(self.gy))
+                h, w = len(height_grid), len(height_grid[0])
+                
+                # Fetch roughness (0.0 to 1.0)
+                local_roughness = 0.0
+                if roughness_grid and 0 <= ry_int < h and 0 <= rx_int < w:
+                    local_roughness = roughness_grid[ry_int][rx_int]
+                
+                # Dynamic speed: moves up to 4x slower on max roughness
+                effective_speed = self.speed / (1.0 + local_roughness * 3.0)
+                self.current_speed = effective_speed
+                
+                self.gx += (dx / dist) * effective_speed
+                self.gy += (dy / dist) * effective_speed
+        else:
+            self.current_speed = 0.0
 
     def restore_state(self, data):
         """Restores the rover's physical state from a dictionary."""
