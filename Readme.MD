@@ -1,4 +1,4 @@
-#  SpaceRover — Lunar Pathfinding Simulator
+#  LunAura Lunar Pathfinding Simulator
 
 An isometric lunar terrain explorer with real-time A\* and Dijkstra pathfinding, fog-of-war radar, dynamic obstacle avoidance, and procedurally generated terrain.
 
